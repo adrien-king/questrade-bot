@@ -1,158 +1,245 @@
 import os
 import time
 import logging
+from typing import Any, Dict, Optional
 
 import requests
 from flask import Flask, request, jsonify
 
+# ------------------------------------------------------------------------------
+# Flask app & logging
+# ------------------------------------------------------------------------------
+
 app = Flask(__name__)
 
-# ------------------------------------------------------------------------------
-# Config from environment
-# ------------------------------------------------------------------------------
-
-REFRESH_TOKEN = os.environ.get("QUESTRADE_REFRESH_TOKEN")
-ACCOUNT_NUMBER = os.environ.get("QUESTRADE_ACCOUNT_NUMBER")
-POSITION_DOLLARS = float(os.environ.get("POSITION_DOLLARS", "500"))
-DRY_RUN = os.environ.get("DRY_RUN", "1") == "1"
-
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = app.logger
-
-if not REFRESH_TOKEN or not ACCOUNT_NUMBER:
-    logger.warning("QUESTRADE_REFRESH_TOKEN or QUESTRADE_ACCOUNT_NUMBER is not set!")
+logger.setLevel(logging.INFO)
 
 # ------------------------------------------------------------------------------
-# Questrade auth state
+# Environment variables
 # ------------------------------------------------------------------------------
 
-access_token = None
-api_server = None
-token_expiry = 0  # unix timestamp
+def env_bool(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return str(v).strip() not in ("0", "false", "False", "")
 
 
-def refresh_tokens_if_needed():
+def env_float(name: str, default: float) -> float:
+    v = os.environ.get(name)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+DRY_RUN = env_bool("DRY_RUN", True)  # 1 = simulate only, 0 = real orders
+MAX_POSITION_USD = env_float("MAX_POSITION_USD", 1000.0)
+POSITION_DOLLARS = env_float("POSITION_DOLLARS", 100.0)
+RISK_PER_TRADE = env_float("RISK_PER_TRADE", 50.0)
+
+QUESTRADE_ACCOUNT_NUMBER = os.environ.get("QUESTRADE_ACCOUNT_NUMBER", "").strip()
+QUESTRADE_REFRESH_TOKEN = os.environ.get("QUESTRADE_REFRESH_TOKEN", "").strip()
+
+# practice flag is here mostly for clarity; Questrade decides account from token
+QUESTRADE_PRACTICE = env_bool("QUESTRADE_PRACTICE", True)
+
+if not QUESRADE_ACCOUNT_NUMBER := QUESRADE_ACCOUNT_NUMBER:
+    logger.warning("QUESTRADE_ACCOUNT_NUMBER not set – order placement will fail")
+
+if not QUESTRADE_REFRESH_TOKEN:
+    logger.warning("QUESTRADE_REFRESH_TOKEN not set – Questrade API will fail")
+
+# ------------------------------------------------------------------------------
+# Questrade OAuth + API helpers
+# ------------------------------------------------------------------------------
+
+QT_ACCESS_TOKEN: Optional[str] = None
+QT_API_SERVER: Optional[str] = None
+QT_TOKEN_EXPIRES_AT: float = 0.0  # epoch seconds
+
+
+def refresh_qt_token() -> None:
     """
-    Refresh Questrade access token if we don't have one or it's about to expire.
-    Updates global access_token, api_server, token_expiry, and REFRESH_TOKEN.
+    Use the long-lived refresh token to obtain a short-lived access token
+    and the base API server URL.
     """
-    global access_token, api_server, token_expiry, REFRESH_TOKEN
+    global QT_ACCESS_TOKEN, QT_API_SERVER, QT_TOKEN_EXPIRES_AT
 
-    now = time.time()
-    if access_token and now < token_expiry - 60:
-        return  # still valid
-
-    if not REFRESH_TOKEN:
-        raise RuntimeError("No Questrade REFRESH_TOKEN configured")
+    if not QUESTRADE_REFRESH_TOKEN:
+        raise RuntimeError("Missing QUESRADE_REFRESH_TOKEN")
 
     url = (
         "https://login.questrade.com/oauth2/token"
-        f"?grant_type=refresh_token&refresh_token={REFRESH_TOKEN}"
+        f"?grant_type=refresh_token&refresh_token={QUESTRADE_REFRESH_TOKEN}"
     )
-    logger.info("Refreshing Questrade tokens")
+
+    logger.info("Refreshing Questrade token…")
     resp = requests.get(url, timeout=10)
     resp.raise_for_status()
     data = resp.json()
 
-    access_token = data["access_token"]
-    api_server = data["api_server"].rstrip("/")  # e.g. https://api01.iq.questrade.com
-    expires_in = int(data.get("expires_in", 1800))
-    token_expiry = now + expires_in
-
-    new_refresh = data.get("refresh_token")
-    if new_refresh and new_refresh != REFRESH_TOKEN:
-        REFRESH_TOKEN = new_refresh
-        logger.warning(
-            "Questrade returned a NEW refresh token. "
-            "Update your Render env QUESTRADE_REFRESH_TOKEN if you redeploy."
-        )
+    QT_ACCESS_TOKEN = data["access_token"]
+    QT_API_SERVER = data["api_server"].rstrip("/")
+    expires_in = data.get("expires_in", 1800)
+    QT_TOKEN_EXPIRES_AT = time.time() + float(expires_in) * 0.9  # renew a bit early
 
     logger.info(
-        "Questrade auth OK. api_server=%s, expires_in=%s", api_server, expires_in
+        "Questrade token refreshed. api_server=%s, expires_in=%s",
+        QT_API_SERVER,
+        expires_in,
     )
 
 
-def qt_request(method: str, path: str, **kwargs):
+def ensure_qt_token() -> None:
+    if QT_ACCESS_TOKEN is None or QT_API_SERVER is None or time.time() >= QT_TOKEN_EXPIRES_AT:
+        refresh_qt_token()
+
+
+def qt_request(method: str, path: str, **kwargs) -> Dict[str, Any]:
     """
-    Make an authenticated request to the Questrade API.
-    path should start with '/v1/...'
+    Helper to call Questrade API with auto token refresh.
+    path: "/v1/..." (no server)
     """
-    refresh_tokens_if_needed()
+    ensure_qt_token()
+    assert QT_API_SERVER is not None
+    assert QT_ACCESS_TOKEN is not None
+
+    url = QT_API_SERVER + path
     headers = kwargs.pop("headers", {})
-    headers["Authorization"] = f"Bearer {access_token}"
-    url = api_server + path
+    headers["Authorization"] = f"Bearer {QT_ACCESS_TOKEN}"
+    headers.setdefault("Content-Type", "application/json")
+
+    logger.info("Questrade %s %s", method, path)
     resp = requests.request(method, url, headers=headers, timeout=10, **kwargs)
-    logger.info(
-        "Questrade %s %s -> %s %s",
-        method,
-        path,
-        resp.status_code,
-        resp.text[:300],
-    )
+
+    # If token expired unexpectedly, refresh once and retry
+    if resp.status_code == 401:
+        logger.warning("401 from Questrade, refreshing token and retrying…")
+        refresh_qt_token()
+        headers["Authorization"] = f"Bearer {QT_ACCESS_TOKEN}"
+        resp = requests.request(method, url, headers=headers, timeout=10, **kwargs)
+
     resp.raise_for_status()
-    if "application/json" in resp.headers.get("Content-Type", ""):
-        return resp.json()
-    return resp.text
+    if resp.text:
+        try:
+            return resp.json()
+        except ValueError:
+            logger.warning("Non-JSON response from Questrade: %s", resp.text)
+            return {}
+    return {}
 
 
 # ------------------------------------------------------------------------------
-# Helpers: symbol lookup, price, order placement
+# Questrade trading helpers
 # ------------------------------------------------------------------------------
 
-_symbol_cache = {}
+_symbol_id_cache: Dict[str, int] = {}
 
 
 def get_symbol_id(symbol: str) -> int:
     """
-    Resolve symbol string like 'AHMA' to Questrade symbolId, with a simple cache.
+    Look up the Questrade symbolId for a ticker, with caching.
     """
-    symbol = symbol.upper()
-    if symbol in _symbol_cache:
-        return _symbol_cache[symbol]
+    sym = symbol.upper()
+    if sym in _symbol_id_cache:
+        return _symbol_id_cache[sym]
 
-    data = qt_request("GET", f"/v1/symbols/search?prefix={symbol}")
-    for s in data.get("symbols", []):
-        if s.get("symbol") == symbol:
-            symbol_id = s["symbolId"]
-            _symbol_cache[symbol] = symbol_id
-            return symbol_id
+    data = qt_request("GET", f"/v1/symbols?names={sym}")
+    syms = data.get("symbols") or []
+    if not syms:
+        raise RuntimeError(f"Symbol not found in Questrade: {sym}")
 
-    raise ValueError(f"Symbol '{symbol}' not found on Questrade")
+    symbol_id = int(syms[0]["symbolId"])
+    _symbol_id_cache[sym] = symbol_id
+    return symbol_id
 
 
 def get_last_price(symbol_id: int) -> float:
     data = qt_request("GET", f"/v1/markets/quotes/{symbol_id}")
-    quotes = data.get("quotes", [])
+    quotes = data.get("quotes") or []
     if not quotes:
-        raise ValueError(f"No quotes returned for symbolId={symbol_id}")
+        raise RuntimeError(f"No quote for symbolId={symbol_id}")
     q = quotes[0]
-    last = q.get("lastTradePrice") or q.get("lastTradePriceTrHrs") or q.get("last")
-    if last is None:
-        raise ValueError(f"No last price in quote for symbolId={symbol_id}")
+    last = q.get("lastTradePrice") or q.get("lastTradePriceTrHrs") or q.get("bidPrice")
     return float(last)
 
 
-def place_qt_order(symbol: str, side: str, event: str):
+def get_total_exposure_usd() -> float:
+    """
+    Approximate current exposure in USD based on positions.
+    Only used to enforce MAX_POSITION_USD.
+    """
+    if not QUESTRADE_ACCOUNT_NUMBER:
+        return 0.0
+
+    data = qt_request("GET", f"/v1/accounts/{QUESTRADE_ACCOUNT_NUMBER}/positions")
+    positions = data.get("positions") or []
+    total = 0.0
+    for p in positions:
+        try:
+            total += float(p.get("currentMarketValue", 0.0))
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def place_qt_order(symbol: str, side: str, event: str) -> Dict[str, Any]:
     """
     Place a MARKET order on Questrade based on TradingView event.
-    - event: 'ENTRY' or 'EXIT'
-    - side: 'long' (we only support long for now)
+    - event: 'ENTRY' / 'BUY' / 'OPEN' / 'LONG'  -> Buy
+    - event: 'EXIT'  / 'SELL' / 'CLOSE'        -> Sell
+    - side:  'long' (only long supported for now)
     """
+    if not QUESTRADE_ACCOUNT_NUMBER:
+        msg = "QUESTRADE_ACCOUNT_NUMBER not set"
+        logger.error(msg)
+        return {"ok": False, "error": msg}
+
     # TradingView sometimes sends "NASDAQ:AMZN" → strip prefix
     if ":" in symbol:
         symbol = symbol.split(":", 1)[1]
 
     symbol = symbol.upper()
+    event_clean = (event or "").strip().upper()
+    side_clean = (side or "").strip().lower()
 
-    if event == "ENTRY" and side == "long":
+    # Map multiple spellings to entry/exit
+    is_entry = event_clean in ("ENTRY", "BUY", "OPEN", "LONG")
+    is_exit = event_clean in ("EXIT", "SELL", "CLOSE")
+
+    if is_entry and side_clean == "long":
         action = "Buy"
-    elif event == "EXIT" and side == "long":
+    elif is_exit and side_clean == "long":
         action = "Sell"
     else:
-        msg = f"Unsupported event/side combination: event={event}, side={side}"
+        msg = f"Unsupported event/side combination: event={event_clean}, side={side_clean}"
         logger.warning(msg)
         return {"ok": False, "error": msg}
+
+    # Risk / exposure check
+    try:
+        current_exposure = get_total_exposure_usd()
+    except Exception as e:
+        logger.warning("Could not fetch exposure, continuing anyway: %s", e)
+        current_exposure = 0.0
+
+    if is_entry and current_exposure + POSITION_DOLLARS > MAX_POSITION_USD:
+        msg = (
+            f"Exposure limit reached: current={current_exposure:.2f}, "
+            f"would_add={POSITION_DOLLARS:.2f}, max={MAX_POSITION_USD:.2f}"
+        )
+        logger.warning(msg)
+        return {"ok": False, "error": msg, "exposure": current_exposure}
 
     symbol_id = get_symbol_id(symbol)
     last_price = get_last_price(symbol_id)
@@ -183,52 +270,96 @@ def place_qt_order(symbol: str, side: str, event: str):
         logger.info("[DRY RUN] Would send order: %s", order)
         return {"ok": True, "dry_run": True, "order": order}
 
-    payload = {"accountNumber": ACCOUNT_NUMBER, "orders": [order]}
-    res = qt_request("POST", f"/v1/accounts/{ACCOUNT_NUMBER}/orders", json=payload)
-    return {"ok": True, "response": res}
+    payload = {"accountNumber": QUESTRADE_ACCOUNT_NUMBER, "orders": [order]}
+    res = qt_request(
+        "POST",
+        f"/v1/accounts/{QUESTRADE_ACCOUNT_NUMBER}/orders",
+        json=payload,
+    )
+    logger.info("Order response: %s", res)
+    return {"ok": True, "response": res, "order": order}
 
 
 # ------------------------------------------------------------------------------
-# Flask routes
+# Routes
 # ------------------------------------------------------------------------------
 
 @app.route("/health", methods=["GET"])
-def health():
+def health() -> tuple[str, int]:
+    logger.info("HEALTH CHECK HIT")
     return "OK", 200
 
 
 @app.route("/tv", methods=["GET", "POST"])
-def tv():
-    if request.method == "GET":
-        return "Use POST with JSON body", 400
-
+def tv() -> tuple[Any, int]:
+    # Log EVERYTHING that hits this route
     raw_body = request.get_data(as_text=True)
-    logger.info("TV HIT: method=%s path=%s body=%s", request.method, request.path, raw_body)
+    logger.info(
+        "TV HIT: method=%s path=%s body='%s'",
+        request.method,
+        request.path,
+        raw_body,
+    )
 
-    try:
-        data = request.get_json(force=True, silent=False)
-    except Exception:
-        logger.exception("Failed to parse JSON from TradingView")
-        return jsonify({"ok": False, "error": "invalid JSON", "raw": raw_body}), 400
+    # If someone opens it in a browser (GET), just tell them to use POST
+    if request.method != "POST":
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "Use POST with JSON body",
+                }
+            ),
+            405,
+        )
 
-    symbol = str(data.get("symbol") or data.get("ticker") or "").strip()
-    event = str(data.get("event") or "").strip().upper()
-    side = str(data.get("side") or "long").strip().lower()
+    # Try to parse JSON
+    data = request.get_json(silent=True) or {}
+    logger.info("TV PARSED JSON: %s", data)
+
+    symbol = str(data.get("symbol", "")).strip().upper()
+    event = str(data.get("event", "")).strip()
+    side = str(data.get("side", "")).strip().lower()
+    risk_stop_pct = data.get("risk_stop_pct")
 
     if not symbol or not event:
-        msg = "Missing symbol or event in payload"
-        logger.warning("%s: %s", msg, data)
-        return jsonify({"ok": False, "error": msg, "received": data}), 400
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "Missing symbol or event",
+                    "received": data,
+                }
+            ),
+            400,
+        )
 
+    # Call trading logic
     try:
-        trade_result = place_qt_order(symbol, side, event)
+        result = place_qt_order(symbol=symbol, side=side, event=event)
+        return jsonify({"ok": True, "result": result, "risk_stop_pct": risk_stop_pct}), 200
+    except requests.HTTPError as e:
+        logger.exception("HTTP error from Questrade")
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "Questrade HTTP error",
+                    "status_code": e.response.status_code if e.response else None,
+                    "response_text": e.response.text if e.response else None,
+                }
+            ),
+            500,
+        )
     except Exception as e:
-        logger.exception("Error placing Questrade order")
-        return jsonify({"ok": False, "error": str(e), "received": data}), 500
+        logger.exception("Unhandled error placing Questrade order")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-    return jsonify({"ok": True, "received": data, "trade": trade_result}), 200
 
+# ------------------------------------------------------------------------------
+# Entry point for local dev
+# ------------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
+    port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
