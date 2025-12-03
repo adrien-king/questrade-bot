@@ -1,203 +1,386 @@
 import os
 import logging
-from flask import Flask, request, jsonify
 import requests
-import json
+from flask import Flask, request, jsonify
 
-# --------------------------------------------------------------------
-# Basic Flask + logging
-# --------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Flask + logging setup
+# ------------------------------------------------------------------------------
+
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+log = app.logger
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
-logger = app.logger
-
-# --------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # Environment variables
-# --------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+
 QUESTRADE_REFRESH_TOKEN = os.getenv("QUESTRADE_REFRESH_TOKEN")
 QUESTRADE_ACCOUNT_NUMBER = os.getenv("QUESTRADE_ACCOUNT_NUMBER")
-QUESTRADE_PRACTICE = os.getenv("QUESTRADE_PRACTICE", "1")
+QUESTRADE_PRACTICE = os.getenv("QUESTRADE_PRACTICE", "1")  # "1" = practice, "0" = live
+
 POSITION_DOLLARS = float(os.getenv("POSITION_DOLLARS", "1000"))
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "50"))
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "50"))  # not used for size yet, but logged
 DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
 
+MAX_POSITION_USD = float(os.getenv("MAX_POSITION_USD", "0") or "0")  # optional, just in case
+
+# Basic validation
 if not QUESTRADE_REFRESH_TOKEN:
-    raise RuntimeError("Missing QUESTRADE_REFRESH_TOKEN env var")
+    raise ValueError("Missing Questrade refresh token (QUESTRADE_REFRESH_TOKEN).")
+
 if not QUESTRADE_ACCOUNT_NUMBER:
-    raise RuntimeError("Missing QUESTRADE_ACCOUNT_NUMBER env var")
+    raise ValueError("Missing Questrade account number (QUESTRADE_ACCOUNT_NUMBER).")
 
-# --------------------------------------------------------------------
-# Base URL for trading API (not login)
-# --------------------------------------------------------------------
-def get_base_api_url(api_server: str) -> str:
-    # api_server from Questrade already includes https:// and trailing slash
-    return api_server.rstrip("/")
+log.info(
+    "Config loaded: PRACTICE=%s, DRY_RUN=%s, POSITION_DOLLARS=%.2f, RISK_PER_TRADE=%.2f",
+    QUESTRADE_PRACTICE,
+    DRY_RUN,
+    POSITION_DOLLARS,
+    RISK_PER_TRADE,
+)
 
-# --------------------------------------------------------------------
-# Refresh access token  *** UPDATED ***
-# --------------------------------------------------------------------
-def qt_refresh_access_token():
-    """Refresh Questrade access token using the REFRESH token.
+# ------------------------------------------------------------------------------
+# Helpers: base URL / token refresh / symbol lookup / last price / place order
+# ------------------------------------------------------------------------------
 
-    Uses practicelogin.questrade.com when QUESTRADE_PRACTICE=1.
-    Adds detailed logging so we can see exactly what Questrade returned.
+
+def _login_base_url() -> str:
     """
-    practice = (QUESTRADE_PRACTICE == "1")
-    login_host = "https://practicelogin.questrade.com" if practice else "https://login.questrade.com"
+    Questrade OAuth login host is fixed.
+    """
+    return "https://login.questrade.com"
 
-    params = {
-        "grant_type": "refresh_token",
-        "refresh_token": QUESTRADE_REFRESH_TOKEN,
-    }
 
-    url = f"{login_host}/oauth2/token"
+def qt_refresh_access_token():
+    """
+    Use the long-lived refresh token (from Questrade web UI) to get:
+      - short-lived access_token
+      - api_server base URL
+    """
+    token_prefix = (QUESTRADE_REFRESH_TOKEN or "")[:5]
+    url = f"{_login_base_url()}/oauth2/token?grant_type=refresh_token&refresh_token={QUESTRADE_REFRESH_TOKEN}"
 
-    logger.info(
-        "QT: refreshing token at %s (practice=%s) token_prefix=%s",
-        url,
-        practice,
-        QUESTRADE_REFRESH_TOKEN[:8],
+    log.info(
+        "qt_refresh_access_token: refreshing token (practice=%s, token_prefix=%s...)",
+        QUESTRADE_PRACTICE,
+        token_prefix,
     )
 
-    try:
-        r = requests.get(url, params=params, timeout=10)
-    except Exception as e:
-        logger.exception("QT: exception while calling token endpoint: %s", e)
-        raise
-
-    # Log full status + first part of body so we can diagnose 400s
-    logger.info(
-        "QT: token refresh response status=%s body=%s",
+    r = requests.get(url)
+    log.info(
+        "qt_refresh_access_token: refresh token response status=%s body=%s",
         r.status_code,
-        r.text[:500],
+        r.text[:400],
     )
 
     if r.status_code != 200:
-        # This is exactly the error you’re seeing now.
-        # In practice, 400 here usually means:
-        #   - wrong host (login vs practicelogin), or
-        #   - refresh token is invalid/expired/already used.
-        raise Exception(f"Failed to refresh token: {r.status_code} {r.text}")
+        raise Exception(f"Failed to refresh token: {r.text}")
 
     data = r.json()
     access_token = data["access_token"]
-    api_server = data["api_server"]
+    api_server = data["api_server"]  # e.g. "https://api01.iq.questrade.com/"
 
-    logger.info("QT: token refresh OK, api_server=%s, expires_in=%s", api_server, data.get("expires_in"))
+    log.info("qt_refresh_access_token: got api_server=%s", api_server)
     return access_token, api_server
 
-# --------------------------------------------------------------------
-# Get last price
-# --------------------------------------------------------------------
-def get_last_price(access_token, api_server, symbol):
-    headers = {"Authorization": f"Bearer {access_token}"}
-    url = f"{get_base_api_url(api_server)}/v1/markets/quotes/{symbol}"
-    logger.info("QT: fetching last price for %s from %s", symbol, url)
-    r = requests.get(url, headers=headers, timeout=10)
-    logger.info("QT: last price status=%s body=%s", r.status_code, r.text[:300])
-    r.raise_for_status()
+
+def qt_headers(access_token: str) -> dict:
+    return {"Authorization": f"Bearer {access_token}"}
+
+
+def qt_get_symbol_id(access_token: str, api_server: str, symbol: str) -> int:
+    """
+    Resolve a ticker like 'PLRZ' to a Questrade symbolId.
+    """
+    url = f"{api_server}v1/symbols/search?prefix={symbol}"
+    log.info("qt_get_symbol_id: GET %s", url)
+
+    r = requests.get(url, headers=qt_headers(access_token))
+    log.info(
+        "qt_get_symbol_id: status=%s body=%s",
+        r.status_code,
+        r.text[:400],
+    )
+
+    if r.status_code != 200:
+        raise Exception(f"Failed to lookup symbolId for {symbol}: {r.text}")
+
     data = r.json()
-    return data["quotes"][0]["lastTradePrice"]
+    symbols = data.get("symbols", [])
+    if not symbols:
+        raise Exception(f"No symbols found for {symbol}")
 
-# --------------------------------------------------------------------
-# Place order
-# --------------------------------------------------------------------
-def qt_place_order(symbol, side, risk_stop_pct):
+    # Prefer exact match if present
+    exact = [s for s in symbols if s.get("symbol") == symbol]
+    chosen = (exact[0] if exact else symbols[0])
+    symbol_id = chosen["symbolId"]
+
+    log.info(
+        "qt_get_symbol_id: symbol=%s symbolId=%s (chosen=%s)",
+        symbol,
+        symbol_id,
+        chosen.get("symbol"),
+    )
+    return symbol_id
+
+
+def get_last_price(access_token: str, api_server: str, symbol: str) -> float:
+    """
+    Fetch last trade price for the given symbol.
+    """
+    url = f"{api_server}v1/markets/quotes/{symbol}"
+    log.info("get_last_price: GET %s", url)
+
+    r = requests.get(url, headers=qt_headers(access_token))
+    log.info(
+        "get_last_price: status=%s body=%s",
+        r.status_code,
+        r.text[:400],
+    )
+
+    if r.status_code != 200:
+        raise Exception(f"Failed to get last price for {symbol}: {r.text}")
+
+    data = r.json()
+    price = float(data["quotes"][0]["lastTradePrice"])
+    log.info("get_last_price: symbol=%s last_price=%.4f", symbol, price)
+    return price
+
+
+def qt_place_order(symbol: str, side: str, risk_stop_pct: float):
+    """
+    Place a market order via Questrade.
+
+    side:
+        "long" -> buy
+        "sell" -> sell
+
+    Returns: Questrade JSON response.
+    """
+    # Refresh token + get api_server
     access_token, api_server = qt_refresh_access_token()
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
 
+    # Lookup symbolId
+    symbol_id = qt_get_symbol_id(access_token, api_server, symbol)
+
+    # Get last price (for position sizing / logging)
     last_price = get_last_price(access_token, api_server, symbol)
-    shares = max(1, int(POSITION_DOLLARS / last_price))
 
-    order = {
-        "symbol": symbol,
-        "quantity": shares,
-        "isBuy": True if side == "long" else False,
+    # Position sizing: fixed notional
+    shares = max(1, int(POSITION_DOLLARS / last_price))
+    log.info(
+        "qt_place_order: symbol=%s side=%s last_price=%.4f shares=%s risk_stop_pct=%s",
+        symbol,
+        side,
+        last_price,
+        shares,
+        risk_stop_pct,
+    )
+
+    # Optional: simple max position cap
+    if MAX_POSITION_USD > 0 and POSITION_DOLLARS > MAX_POSITION_USD:
+        raise Exception(
+            f"Requested position {POSITION_DOLLARS} exceeds MAX_POSITION_USD={MAX_POSITION_USD}"
+        )
+
+    leg_side = "Buy" if side == "long" else "Sell"
+
+    order_body = {
+        "accountNumber": QUESTRADE_ACCOUNT_NUMBER,
         "orderType": "Market",
         "timeInForce": "Day",
         "primaryRoute": "AUTO",
         "secondaryRoute": "AUTO",
+        "isAllOrNone": False,
+        "isAnonymous": False,
+        "orderLegs": [
+            {
+                "symbolId": symbol_id,
+                "legSide": leg_side,
+                "quantity": shares,
+            }
+        ],
     }
 
-    logger.info(
-        "QT: preparing order (DRY_RUN=%s) symbol=%s side=%s qty=%s last_price=%s risk_stop_pct=%.2f",
-        DRY_RUN,
-        symbol,
-        side,
-        shares,
-        last_price,
-        risk_stop_pct,
+    url = f"{api_server}v1/accounts/{QUESTRADE_ACCOUNT_NUMBER}/orders"
+    log.info("qt_place_order: POST %s body=%s", url, order_body)
+
+    r = requests.post(url, headers=qt_headers(access_token), json=order_body)
+    log.info(
+        "qt_place_order: response status=%s body=%s",
+        r.status_code,
+        r.text[:500],
     )
 
-    if DRY_RUN:
-        logger.info("QT: DRY_RUN=True -> NOT sending order to Questrade")
-        return {"status": "dry_run", "order": order}
+    if r.status_code >= 300:
+        raise Exception(f"Order rejected: {r.status_code} {r.text}")
 
-    url = f"{get_base_api_url(api_server)}/v1/accounts/{QUESTRADE_ACCOUNT_NUMBER}/orders"
-    logger.info("QT: POST order to %s", url)
-    r = requests.post(url, headers=headers, data=json.dumps(order), timeout=10)
-    logger.info("QT: order response status=%s body=%s", r.status_code, r.text[:500])
-    r.raise_for_status()
     return r.json()
 
-# --------------------------------------------------------------------
-# Health check
-# --------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------------------------
+
+
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"}), 200
+    """
+    Simple health check endpoint.
+    """
+    log.info("HEALTH CHECK HIT")
+    return "OK", 200
 
-# --------------------------------------------------------------------
-# TradingView webhook endpoint
-# --------------------------------------------------------------------
-@app.route("/tv", methods=["POST"])
+
+@app.route("/tv", methods=["GET", "POST"])
 def tv():
+    """
+    TradingView webhook endpoint.
+
+    Expects JSON like:
+    {
+        "symbol": "PLRZ",
+        "event": "BUY" | "SELL" | "ENTRY" | "EXIT",
+        "side": "long",
+        "risk_stop_pct": 2.0
+    }
+    """
+    # Log everything that hits this route
+    raw_body = request.get_data(as_text=True)
+    log.info("TV Webhook raw body: %s", raw_body)
+
+    if request.method != "POST":
+        log.info(
+            "TV HIT with non-POST method=%s path=%s", request.method, request.path
+        )
+        return jsonify({"ok": False, "error": "Use POST with JSON body"}), 405
+
+    # Try to parse JSON
     try:
-        raw = request.get_data(as_text=True)
-        logger.info("TV Webhook raw body: %s", raw)
+        data = request.get_json(force=True) or {}
+    except Exception as e:
+        log.exception("TV JSON parse error")
+        return jsonify({"ok": False, "error": "Bad JSON", "detail": str(e)}), 400
 
-        data = request.get_json(force=True, silent=False)
-        logger.info("TV Webhook parsed JSON: %s", data)
+    log.info("TV Webhook parsed JSON: %s", data)
 
-        symbol = data.get("symbol")
-        event = data.get("event")
-        side = data.get("side")
-        risk_stop_pct = float(data.get("risk_stop_pct", RISK_PER_TRADE))
+    symbol = str(data.get("symbol", "")).upper()
+    event = str(data.get("event", "")).upper()
+    side = str(data.get("side", "")).lower()
+    risk_stop_pct = float(data.get("risk_stop_pct", RISK_PER_TRADE))
 
-        logger.info(
-            "TV Webhook parsed -> symbol='%s', event='%s', side='%s', risk_stop_pct=%.2f, DRY_RUN=%s",
-            symbol,
-            event,
-            side,
-            risk_stop_pct,
-            DRY_RUN,
+    log.info(
+        "TV Webhook parsed -> symbol=%s, event=%s, side=%s, risk_stop_pct=%s, DRY_RUN=%s",
+        symbol,
+        event,
+        side,
+        risk_stop_pct,
+        DRY_RUN,
+    )
+
+    if not symbol:
+        log.warning("TV Webhook missing symbol")
+        return jsonify({"ok": False, "error": "Missing symbol", "received": data}), 400
+
+    # ------------------------------------------------------------------
+    # EVENT / SIDE MAPPING
+    # ------------------------------------------------------------------
+    # We accept both the "BUY/SELL" and "ENTRY/EXIT" styles.
+    action = None  # "BUY" or "SELL"
+
+    if side == "long" and event in ("BUY", "ENTRY"):
+        action = "BUY"
+    elif side == "long" and event in ("SELL", "EXIT"):
+        action = "SELL"
+    else:
+        log.warning("TV Webhook: unsupported combo event=%s side=%s", event, side)
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "Unsupported event/side combo",
+                    "event": event,
+                    "side": side,
+                }
+            ),
+            400,
         )
 
-        if event == "BUY":
-            logger.info("INFO: ENTRY detected => placing BUY order.")
-            result = qt_place_order(symbol, "long", risk_stop_pct)
-        elif event == "SELL":
-            logger.info("INFO: EXIT detected => not placing new order (flat logic only).")
-            result = {"status": "sell_signal_received"}
-        else:
-            logger.warning("TV Webhook: unsupported event '%s'", event)
-            return jsonify({"error": "unsupported event"}), 400
+    # ------------------------------------------------------------------
+    # DRY RUN HANDLING
+    # ------------------------------------------------------------------
+    if DRY_RUN:
+        log.info(
+            "DRY_RUN=True -> would place %s for %s with risk_stop_pct=%s",
+            action,
+            symbol,
+            risk_stop_pct,
+        )
+        return (
+            jsonify(
+                {
+                    "ok": True,
+                    "dry_run": True,
+                    "symbol": symbol,
+                    "event": event,
+                    "side": side,
+                    "mapped_action": action,
+                    "risk_stop_pct": risk_stop_pct,
+                }
+            ),
+            200,
+        )
 
-        return jsonify({"ok": True, "result": result}), 200
+    # ------------------------------------------------------------------
+    # LIVE ORDER
+    # ------------------------------------------------------------------
+    try:
+        qt_side = "long" if action == "BUY" else "sell"
+        log.info(
+            "LIVE ORDER: %s %s (qt_side=%s, risk_stop_pct=%s)",
+            action,
+            symbol,
+            qt_side,
+            risk_stop_pct,
+        )
+
+        result = qt_place_order(symbol, qt_side, risk_stop_pct)
+        log.info("Order result: %s", result)
+
+        return (
+            jsonify(
+                {
+                    "ok": True,
+                    "symbol": symbol,
+                    "event": event,
+                    "side": side,
+                    "mapped_action": action,
+                    "risk_stop_pct": risk_stop_pct,
+                    "broker_result": result,
+                }
+            ),
+            200,
+        )
 
     except Exception as e:
-        logger.exception("ERROR: app Exception on /tv [POST]")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        log.exception("ERROR: app-exception on /tv while placing order")
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "order_failed",
+                    "detail": str(e),
+                }
+            ),
+            500,
+        )
 
-# --------------------------------------------------------------------
-# Gunicorn entrypoint
-# --------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# Entry point for local dev (Render uses gunicorn via Procfile)
+# ------------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
