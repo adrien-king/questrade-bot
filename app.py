@@ -144,29 +144,25 @@ def _login_base_url() -> str:
     return "https://login.questrade.com"
 
 def qt_refresh_access_token():
-    """
-    Refresh token -> access_token + api_server
-    """
-    token_prefix = (QUESTRADE_REFRESH_TOKEN or "")[:6]
-    url = f"{_login_base_url()}/oauth2/token?grant_type=refresh_token&refresh_token={QUESTRADE_REFRESH_TOKEN}"
+    url = f"{_login_base_url()}/oauth2/token"
+    params = {
+        "grant_type": "refresh_token",
+        "refresh_token": QUESTRADE_REFRESH_TOKEN,
+    }
 
-    log.info(
-        "[%s] qt_refresh_access_token: GET %s (practice=%s token_prefix=%s...)",
-        g.request_id, _safe_text(url, 140), QUESTRADE_PRACTICE, token_prefix
-    )
+    token_prefix = (QUESTRADE_REFRESH_TOKEN or "")[:5]
+    log.info("qt_refresh_access_token: refreshing token token_prefix=%s...", token_prefix)
 
-    r = requests.get(url, timeout=20)
-    body = _safe_text(_redact(r.text), 600)
-    log.info("[%s] qt_refresh_access_token: status=%s body=%s", g.request_id, r.status_code, body)
+    r = requests.get(url, params=params, timeout=20)
+
+    log.info("qt_refresh_access_token: status=%s body=%s", r.status_code, r.text[:400])
 
     if r.status_code != 200:
-        raise Exception(f"Failed to refresh token: status={r.status_code} body={body}")
+        raise Exception(f"Failed to refresh token: status={r.status_code} body={r.text}")
 
     data = r.json()
-    access_token = data["access_token"]
-    api_server = data["api_server"]  # e.g. "https://api01.iq.questrade.com/"
-    return access_token, api_server
-
+    return data["access_token"], data["api_server"]
+    
 def qt_headers(access_token: str) -> dict:
     return {"Authorization": f"Bearer {access_token}"}
 
