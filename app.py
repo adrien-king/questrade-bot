@@ -1,336 +1,125 @@
 import os
 import time
+import uuid
 import json
+import math
 import logging
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from flask import Flask, request, jsonify
 
-# ------------------------------------------------------------------------------
-# Flask + logging setup
-# ------------------------------------------------------------------------------
+# Google Sheets (service account)
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
+
+# =============================================================================
+# Flask + logging
+# =============================================================================
 app = Flask(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = app.logger
 
-# ------------------------------------------------------------------------------
-# Environment variables
-# ------------------------------------------------------------------------------
-QUESTRADE_REFRESH_TOKEN = os.getenv("QUESTRADE_REFRESH_TOKEN")
-QUESTRADE_ACCOUNT_NUMBER = os.getenv("QUESTRADE_ACCOUNT_NUMBER")
-PRACTICE = os.getenv("PRACTICE", "1")  # informational; refresh token determines practice/live
 
-DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
+# =============================================================================
+# ENV / CONFIG
+# =============================================================================
 
-# Position sizing controls
-USE_RISK_SIZING = os.getenv("USE_RISK_SIZING", "true").lower() in ("1", "true", "yes", "on")
-POSITION_DOLLARS = float(os.getenv("POSITION_DOLLARS", "1000"))  # used if USE_RISK_SIZING = false
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "50"))        # used if USE_RISK_SIZING = true
-MAX_POSITION_USD = float(os.getenv("MAX_POSITION_USD", "0") or "0")
+# --- Questrade ---
+QUESTRADE_REFRESH_TOKEN = os.getenv("QUESTRADE_REFRESH_TOKEN", "").strip()
+QUESTRADE_ACCOUNT_NUMBER = os.getenv("QUESTRADE_ACCOUNT_NUMBER", "").strip()
+PRACTICE = os.getenv("QUESTRADE_PRACTICE", "1").strip()  # "1" practice, "0" live
 
-# Cooldowns
+# --- Bot behavior ---
+DRY_RUN = os.getenv("DRY_RUN", "1").strip() == "1"
+USE_RISK_SIZING = os.getenv("USE_RISK_SIZING", "0").strip() == "1"  # position via risk/$ stop distance
+POSITION_DOLLARS = float(os.getenv("POSITION_DOLLARS", "1000") or "1000")
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "50") or "50")  # $ risk (if USE_RISK_SIZING=1)
+MAX_POSITION_USD = float(os.getenv("MAX_POSITION_USD", "0") or "0")  # optional cap
+
 GLOBAL_COOLDOWN_SEC = int(os.getenv("GLOBAL_COOLDOWN_SEC", "0") or "0")
 SYMBOL_COOLDOWN_SEC = int(os.getenv("SYMBOL_COOLDOWN_SEC", "0") or "0")
 
-# Google Sheets logging
-SHEETS_ON = os.getenv("SHEETS", "off").lower() in ("1", "true", "yes", "on")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GSHEET_ID")
-GOOGLE_SHEET_TAB = os.getenv("GOOGLE_SHEET_TAB", "Sheet1")
-POSITIONS_TAB = os.getenv("POSITIONS_TAB", "Positions")
-GOOGLE_CREDS_PATH = os.getenv("GOOGLE_CREDS_PATH", "/etc/secrets/google_creds.json")
+# --- Sheets ---
+SHEETS_ON = os.getenv("SHEETS_ON", "0").strip() == "1"
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
+GOOGLE_SHEET_TAB = os.getenv("GOOGLE_SHEET_TAB", "Sheet1").strip()  # raw log tab
+POSITIONS_TAB = os.getenv("POSITIONS_TAB", "Positions").strip()
+PNL_TAB = os.getenv("PNL_TAB", "PnL").strip()
+DAILY_TAB = os.getenv("DAILY_TAB", "Daily").strip()
+DASHBOARD_TAB = os.getenv("DASHBOARD_TAB", "Dashboard").strip()
 
-# ------------------------------------------------------------------------------
-# Basic validation (only enforce what is truly required for this config)
-# ------------------------------------------------------------------------------
-if not DRY_RUN:
-    if not QUESTRADE_REFRESH_TOKEN:
-        raise ValueError("Missing Questrade refresh token (QUESTRADE_REFRESH_TOKEN).")
-    if not QUESTRADE_ACCOUNT_NUMBER:
-        raise ValueError("Missing Questrade account number (QUESTRADE_ACCOUNT_NUMBER).")
+# Path to Render secret file (recommended) e.g. /etc/secrets/google_creds.json
+GOOGLE_CREDS_PATH = os.getenv("GOOGLE_CREDS_PATH", "/etc/secrets/google_creds.json").strip()
 
-if SHEETS_ON:
-    if not GOOGLE_SHEET_ID:
-        raise ValueError("SHEETS=on but missing GOOGLE_SHEET_ID (or GSHEET_ID).")
-    if not os.path.exists(GOOGLE_CREDS_PATH):
-        raise ValueError(f"SHEETS=on but GOOGLE_CREDS_PATH file not found: {GOOGLE_CREDS_PATH}")
+if SHEETS_ON and (not GOOGLE_SHEET_ID):
+    raise ValueError("SHEETS_ON=1 but GOOGLE_SHEET_ID is missing.")
+
+if SHEETS_ON and (not os.path.exists(GOOGLE_CREDS_PATH)):
+    raise ValueError(f"SHEETS_ON=1 but GOOGLE_CREDS_PATH not found at {GOOGLE_CREDS_PATH}")
 
 log.info(
-    "Config loaded: PRACTICE=%s DRY_RUN=%s USE_RISK_SIZING=%s POSITION_DOLLARS=%.2f "
-    "RISK_PER_TRADE=%.2f MAX_POSITION_USD=%.2f GLOBAL_COOLDOWN_SEC=%s SYMBOL_COOLDOWN_SEC=%s "
-    "SHEETS_ON=%s SHEET_ID=%s SHEET_TAB=%s POSITIONS_TAB=%s GOOGLE_CREDS_PATH=%s",
-    PRACTICE, DRY_RUN, USE_RISK_SIZING, POSITION_DOLLARS, RISK_PER_TRADE,
-    MAX_POSITION_USD, GLOBAL_COOLDOWN_SEC, SYMBOL_COOLDOWN_SEC,
-    SHEETS_ON, (GOOGLE_SHEET_ID or "")[:12] + "..." if GOOGLE_SHEET_ID else None,
-    GOOGLE_SHEET_TAB, POSITIONS_TAB, GOOGLE_CREDS_PATH
+    "Config loaded: PRACTICE=%s DRY_RUN=%s USE_RISK_SIZING=%s POSITION_DOLLARS=%.2f RISK_PER_TRADE=%.2f "
+    "MAX_POSITION_USD=%.2f GLOBAL_COOLDOWN_SEC=%s SYMBOL_COOLDOWN_SEC=%s SHEETS_ON=%s SHEET_ID=%s SHEET_TAB=%s "
+    "GOOGLE_CREDS_PATH=%s",
+    PRACTICE, DRY_RUN, USE_RISK_SIZING, POSITION_DOLLARS, RISK_PER_TRADE, MAX_POSITION_USD,
+    GLOBAL_COOLDOWN_SEC, SYMBOL_COOLDOWN_SEC,
+    SHEETS_ON, (GOOGLE_SHEET_ID[:6] + "...") if GOOGLE_SHEET_ID else "", GOOGLE_SHEET_TAB,
+    GOOGLE_CREDS_PATH
 )
 
-# ------------------------------------------------------------------------------
-# Small utilities
-# ------------------------------------------------------------------------------
-def now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-def clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
+# =============================================================================
+# Questrade helpers
+# =============================================================================
 
 def _login_base_url() -> str:
     return "https://login.questrade.com"
 
-# ------------------------------------------------------------------------------
-# Google Sheets helpers (only used if SHEETS_ON)
-# ------------------------------------------------------------------------------
-_gs_client = None
-_gs_book = None
-_positions_cache = {"ts": 0, "data": {}}  # simple cache to reduce read calls
-
-
-def gs_init():
-    global _gs_client, _gs_book
-    if not SHEETS_ON:
-        return None
-    if _gs_book is not None:
-        return _gs_book
-
-    # Import inside function to avoid import issues if SHEETS is off
-    import gspread
-    from google.oauth2.service_account import Credentials
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_file(GOOGLE_CREDS_PATH, scopes=scopes)
-    _gs_client = gspread.authorize(creds)
-    _gs_book = _gs_client.open_by_key(GOOGLE_SHEET_ID)
-    return _gs_book
-
-
-def gs_worksheet(name: str):
-    book = gs_init()
-    if book is None:
-        return None
-    try:
-        return book.worksheet(name)
-    except Exception:
-        # Create if missing
-        ws = book.add_worksheet(title=name, rows=2000, cols=30)
-        return ws
-
-
-def ensure_headers(ws, headers):
-    # If sheet is empty, add headers; if first row differs, don’t overwrite (safe)
-    values = ws.get_all_values()
-    if not values:
-        ws.append_row(headers)
-        return
-
-    first = values[0]
-    # If it's shorter or blank-ish, write headers
-    if len(first) < len(headers) or all((c.strip() == "" for c in first)):
-        ws.update("A1", [headers])
-
-
-def append_log_row(row_dict: dict):
+def qt_refresh_access_token() -> Tuple[str, str]:
     """
-    Append a log row into GOOGLE_SHEET_TAB.
-    Auto header creation.
+    Uses refresh token to get access_token + api_server.
+    NOTE: In DRY_RUN we do NOT call Questrade.
     """
-    if not SHEETS_ON:
-        return
+    if not QUESTRADE_REFRESH_TOKEN:
+        raise Exception("Missing QUESTRADE_REFRESH_TOKEN")
 
-    ws = gs_worksheet(GOOGLE_SHEET_TAB)
-    headers = [
-        "timestamp", "symbol", "event", "side", "price", "shares",
-        "position_value", "stop_price", "risk_usd", "status", "note", "pnl_usd"
-    ]
-    ensure_headers(ws, headers)
-
-    # Ensure stable order
-    row = [
-        row_dict.get("timestamp", ""),
-        row_dict.get("symbol", ""),
-        row_dict.get("event", ""),
-        row_dict.get("side", ""),
-        row_dict.get("price", ""),
-        row_dict.get("shares", ""),
-        row_dict.get("position_value", ""),
-        row_dict.get("stop_price", ""),
-        row_dict.get("risk_usd", ""),
-        row_dict.get("status", ""),
-        row_dict.get("note", ""),
-        row_dict.get("pnl_usd", ""),
-    ]
-    ws.append_row(row, value_input_option="USER_ENTERED")
-
-
-def positions_read_all(force=False) -> dict:
-    """
-    Reads Positions tab into {SYMBOL: {state, entry_price, shares, entry_ts, ...}}.
-    Caches for ~3 seconds to reduce API calls.
-    """
-    if not SHEETS_ON:
-        return {}
-
-    if not force and (time.time() - _positions_cache["ts"] < 3):
-        return _positions_cache["data"]
-
-    ws = gs_worksheet(POSITIONS_TAB)
-    headers = [
-        "symbol", "state", "entry_price", "shares", "entry_ts",
-        "entry_value", "last_event", "last_ts"
-    ]
-    ensure_headers(ws, headers)
-
-    rows = ws.get_all_values()
-    data = {}
-    if len(rows) >= 2:
-        head = rows[0]
-        idx = {h: head.index(h) for h in headers if h in head}
-        for r in rows[1:]:
-            if not r or len(r) < 1:
-                continue
-            sym = (r[idx["symbol"]] if "symbol" in idx and idx["symbol"] < len(r) else "").strip().upper()
-            if not sym:
-                continue
-
-            def _get(col, default=""):
-                i = idx.get(col, None)
-                return r[i].strip() if i is not None and i < len(r) else default
-
-            # parse numbers where possible
-            def _f(x):
-                try:
-                    return float(x)
-                except Exception:
-                    return None
-
-            def _i(x):
-                try:
-                    return int(float(x))
-                except Exception:
-                    return None
-
-            data[sym] = {
-                "symbol": sym,
-                "state": _get("state", "FLAT") or "FLAT",
-                "entry_price": _f(_get("entry_price", "")),
-                "shares": _i(_get("shares", "")),
-                "entry_ts": _get("entry_ts", ""),
-                "entry_value": _f(_get("entry_value", "")),
-                "last_event": _get("last_event", ""),
-                "last_ts": _get("last_ts", ""),
-            }
-
-    _positions_cache["ts"] = time.time()
-    _positions_cache["data"] = data
-    return data
-
-
-def pos_get(symbol: str) -> dict:
-    return positions_read_all().get(symbol.upper(), {"symbol": symbol.upper(), "state": "FLAT"})
-
-
-def pos_upsert(symbol: str, state: str, entry_price=None, shares=None, entry_value=None, last_event=None):
-    """
-    Upsert single symbol row in Positions.
-    """
-    if not SHEETS_ON:
-        return
-
-    symbol = symbol.upper()
-    ws = gs_worksheet(POSITIONS_TAB)
-    headers = [
-        "symbol", "state", "entry_price", "shares", "entry_ts",
-        "entry_value", "last_event", "last_ts"
-    ]
-    ensure_headers(ws, headers)
-
-    # Find row by symbol in col A
-    colA = ws.col_values(1)  # includes header at index 0
-    row_idx = None
-    for i, v in enumerate(colA[1:], start=2):
-        if v.strip().upper() == symbol:
-            row_idx = i
-            break
-
-    ts = now_iso()
-    entry_ts = ts if state == "LONG" else ""
-    payload = [
-        symbol,
-        state,
-        "" if entry_price is None else entry_price,
-        "" if shares is None else shares,
-        entry_ts if state == "LONG" else "",
-        "" if entry_value is None else entry_value,
-        "" if last_event is None else last_event,
-        ts,
-    ]
-
-    if row_idx is None:
-        ws.append_row(payload, value_input_option="USER_ENTERED")
-    else:
-        ws.update(f"A{row_idx}:H{row_idx}", [payload])
-
-    # invalidate cache
-    _positions_cache["ts"] = 0
-    _positions_cache["data"] = {}
-
-
-# ------------------------------------------------------------------------------
-# Questrade helpers
-# ------------------------------------------------------------------------------
-def qt_refresh_access_token():
-    """
-    Uses refresh token -> gets access_token + api_server
-    """
     url = f"{_login_base_url()}/oauth2/token?grant_type=refresh_token&refresh_token={QUESTRADE_REFRESH_TOKEN}"
-    token_prefix = (QUESTRADE_REFRESH_TOKEN or "")[:6]
-    log.info("QT: refreshing token token_prefix=%s...", token_prefix)
+    log.info("qt_refresh_access_token: GET %s", url.split("refresh_token=")[0] + "refresh_token=***")
 
-    r = requests.get(url, timeout=30)
-    log.info("QT: token refresh status=%s body=%s", r.status_code, r.text[:400])
+    r = requests.get(url, timeout=20)
+    log.info("qt_refresh_access_token: status=%s body=%s", r.status_code, r.text[:300])
 
     if r.status_code != 200:
-        raise Exception(f"Failed to refresh token: status={r.status_code} body={r.text}")
+        raise Exception(f"Failed to refresh token: status={r.status_code} body={r.text[:300]}")
 
-    j = r.json()
-    return j["access_token"], j["api_server"]
-
+    data = r.json()
+    return data["access_token"], data["api_server"]
 
 def qt_headers(access_token: str) -> dict:
     return {"Authorization": f"Bearer {access_token}"}
 
-
 def qt_get_symbol_id(access_token: str, api_server: str, symbol: str) -> int:
     url = f"{api_server}v1/symbols/search?prefix={symbol}"
-    r = requests.get(url, headers=qt_headers(access_token), timeout=30)
+    r = requests.get(url, headers=qt_headers(access_token), timeout=20)
     if r.status_code != 200:
-        raise Exception(f"Symbol lookup failed for {symbol}: {r.status_code} {r.text}")
-
-    data = r.json()
-    syms = data.get("symbols", [])
-    if not syms:
-        raise Exception(f"No symbol found for {symbol}")
-
-    exact = [s for s in syms if s.get("symbol", "").upper() == symbol.upper()]
-    chosen = exact[0] if exact else syms[0]
+        raise Exception(f"Failed symbol lookup for {symbol}: {r.text[:300]}")
+    symbols = (r.json() or {}).get("symbols", [])
+    if not symbols:
+        raise Exception(f"No symbols found for {symbol}")
+    exact = [s for s in symbols if s.get("symbol") == symbol]
+    chosen = exact[0] if exact else symbols[0]
     return int(chosen["symbolId"])
 
-
-def qt_last_price(access_token: str, api_server: str, symbol: str) -> float:
-    url = f"{api_server}v1/markets/quotes/{symbol}"
-    r = requests.get(url, headers=qt_headers(access_token), timeout=30)
-    if r.status_code != 200:
-        raise Exception(f"Quote failed for {symbol}: {r.status_code} {r.text}")
-    data = r.json()
-    return float(data["quotes"][0]["lastTradePrice"])
-
-
-def qt_place_market_order(symbol: str, side: str, shares: int):
+def qt_place_market_order(symbol: str, action: str, shares: int) -> dict:
     """
-    side: "BUY" or "SELL"
+    action: "BUY" or "SELL"
     """
+    if not QUESTRADE_ACCOUNT_NUMBER:
+        raise Exception("Missing QUESTRADE_ACCOUNT_NUMBER")
+
     access_token, api_server = qt_refresh_access_token()
     symbol_id = qt_get_symbol_id(access_token, api_server, symbol)
 
@@ -344,410 +133,755 @@ def qt_place_market_order(symbol: str, side: str, shares: int):
         "isAnonymous": False,
         "orderLegs": [{
             "symbolId": symbol_id,
-            "legSide": "Buy" if side == "BUY" else "Sell",
+            "legSide": "Buy" if action == "BUY" else "Sell",
             "quantity": int(shares),
         }],
     }
 
     url = f"{api_server}v1/accounts/{QUESTRADE_ACCOUNT_NUMBER}/orders"
-    r = requests.post(url, headers=qt_headers(access_token), json=order_body, timeout=30)
+    log.info("qt_place_market_order: POST %s body=%s", url, {"...": "redacted", "orderLegs": order_body["orderLegs"]})
+
+    r = requests.post(url, headers=qt_headers(access_token), json=order_body, timeout=20)
+    log.info("qt_place_market_order: status=%s body=%s", r.status_code, r.text[:500])
+
     if r.status_code >= 300:
-        raise Exception(f"Order rejected: {r.status_code} {r.text}")
+        raise Exception(f"Order rejected: {r.status_code} {r.text[:500]}")
     return r.json()
 
 
-# ------------------------------------------------------------------------------
-# Sizing + sim helpers
-# ------------------------------------------------------------------------------
-def calc_shares_and_risk(price: float, risk_stop_pct: float):
+# =============================================================================
+# Position sizing / stop
+# =============================================================================
+
+def calc_stop_price(price: float, risk_stop_pct: float) -> float:
+    # long-only
+    return round(price * (1.0 - (risk_stop_pct / 100.0)), 4)
+
+def calc_shares(price: float, risk_stop_pct: float) -> Tuple[int, float, float, str]:
     """
-    Returns:
-      shares, stop_price, risk_usd, position_value, note
+    Returns (shares, position_value, risk_usd, note)
     """
     if price <= 0:
-        raise Exception("Invalid price for sizing")
+        return 0, 0.0, 0.0, "invalid_price"
 
-    stop_price = price * (1 - (risk_stop_pct / 100.0))
-    stop_dist = price - stop_price  # $ per share risk
+    note = ""
 
     if USE_RISK_SIZING:
+        # Shares = risk dollars / stop distance dollars per share
+        stop_dist = price * (risk_stop_pct / 100.0)
         if stop_dist <= 0:
-            raise Exception("Invalid stop distance (risk_stop_pct too small?)")
+            return 0, 0.0, 0.0, "invalid_stop_dist"
 
-        desired_risk = max(0.0, RISK_PER_TRADE)
-        shares = int(desired_risk / stop_dist) if desired_risk > 0 else 1
+        shares = int(math.floor(RISK_PER_TRADE / stop_dist))
         shares = max(1, shares)
-
         position_value = shares * price
-
-        # clamp by MAX_POSITION_USD if set
-        if MAX_POSITION_USD > 0 and position_value > MAX_POSITION_USD:
-            shares = max(1, int(MAX_POSITION_USD / price))
-            position_value = shares * price
-
         risk_usd = shares * stop_dist
 
         note = "Risk-sizing enabled (RISK_PER_TRADE / stop distance)."
-        if MAX_POSITION_USD > 0:
-            note += " Clamped by MAX_POSITION_USD."
+    else:
+        shares = int(math.floor(POSITION_DOLLARS / price))
+        shares = max(1, shares)
+        position_value = shares * price
+        risk_usd = RISK_PER_TRADE  # informational only
+        note = "Fixed notional sizing (POSITION_DOLLARS / price)."
 
-        return shares, stop_price, round(risk_usd, 2), round(position_value, 2), note
+    # Clamp by MAX_POSITION_USD if set
+    if MAX_POSITION_USD > 0 and position_value > MAX_POSITION_USD:
+        clamp_shares = int(math.floor(MAX_POSITION_USD / price))
+        clamp_shares = max(1, clamp_shares)
+        shares = clamp_shares
+        position_value = shares * price
 
-    # fixed notional sizing
-    desired = POSITION_DOLLARS
-    if MAX_POSITION_USD > 0:
-        desired = min(desired, MAX_POSITION_USD)
+        if USE_RISK_SIZING:
+            stop_dist = price * (risk_stop_pct / 100.0)
+            risk_usd = shares * stop_dist
 
-    shares = max(1, int(desired / price))
-    position_value = shares * price
-    risk_usd = shares * stop_dist
-    note = "Fixed-notional sizing (POSITION_DOLLARS)."
-    if MAX_POSITION_USD > 0:
-        note += " Clamped by MAX_POSITION_USD."
+        note += f" Clamped by MAX_POSITION_USD={MAX_POSITION_USD:.2f}."
 
-    return shares, stop_price, round(risk_usd, 2), round(position_value, 2), note
+    return int(shares), round(position_value, 2), round(risk_usd, 2), note
 
 
-# ------------------------------------------------------------------------------
-# Simple in-memory cooldowns (secondary protection)
-# ------------------------------------------------------------------------------
+# =============================================================================
+# Cooldowns (in-memory, best-effort; Sheets state is the real gate)
+# =============================================================================
+
 _last_global_ts = 0.0
-_last_symbol_ts = {}  # symbol -> ts
+_last_symbol_ts: Dict[str, float] = {}
 
-
-def cooldown_check(symbol: str) -> str:
-    """
-    Returns "" if ok, else reason string.
-    """
+def cooldown_block(symbol: str) -> Optional[str]:
     global _last_global_ts
-    symbol = symbol.upper()
+
     now = time.time()
 
-    if GLOBAL_COOLDOWN_SEC > 0 and (now - _last_global_ts) < GLOBAL_COOLDOWN_SEC:
-        return f"Global cooldown active ({GLOBAL_COOLDOWN_SEC}s)."
-
+    if GLOBAL_COOLDOWN_SEC > 0:
+        if now - _last_global_ts < GLOBAL_COOLDOWN_SEC:
+            return f"Global cooldown active ({GLOBAL_COOLDOWN_SEC}s)."
     if SYMBOL_COOLDOWN_SEC > 0:
         last = _last_symbol_ts.get(symbol, 0.0)
-        if (now - last) < SYMBOL_COOLDOWN_SEC:
+        if now - last < SYMBOL_COOLDOWN_SEC:
             return f"Symbol cooldown active for {symbol} ({SYMBOL_COOLDOWN_SEC}s)."
-
-    return ""
-
+    return None
 
 def cooldown_mark(symbol: str):
     global _last_global_ts
-    symbol = symbol.upper()
     now = time.time()
     _last_global_ts = now
     _last_symbol_ts[symbol] = now
 
 
-# ------------------------------------------------------------------------------
+# =============================================================================
+# Google Sheets helpers
+# =============================================================================
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+_svc = None
+
+def sheets_service():
+    global _svc
+    if _svc is not None:
+        return _svc
+
+    creds = service_account.Credentials.from_service_account_file(
+        GOOGLE_CREDS_PATH, scopes=SCOPES
+    )
+    _svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return _svc
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def ensure_tabs_exist(tab_names: List[str]):
+    if not SHEETS_ON:
+        return
+    svc = sheets_service()
+
+    meta = svc.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
+    existing = {s["properties"]["title"] for s in meta.get("sheets", [])}
+
+    requests_batch = []
+    for name in tab_names:
+        if name not in existing:
+            requests_batch.append({"addSheet": {"properties": {"title": name}}})
+
+    if requests_batch:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            body={"requests": requests_batch}
+        ).execute()
+        log.info("Created missing tabs: %s", [r["addSheet"]["properties"]["title"] for r in requests_batch])
+
+def get_header(tab: str) -> List[str]:
+    svc = sheets_service()
+    rng = f"{tab}!1:1"
+    res = svc.spreadsheets().values().get(spreadsheetId=GOOGLE_SHEET_ID, range=rng).execute()
+    vals = (res.get("values") or [])
+    return vals[0] if vals else []
+
+def set_header_if_missing(tab: str, header: List[str]):
+    if not SHEETS_ON:
+        return
+    svc = sheets_service()
+    existing = get_header(tab)
+    if existing and len(existing) > 0:
+        return
+
+    svc.spreadsheets().values().update(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{tab}!1:1",
+        valueInputOption="RAW",
+        body={"values": [header]}
+    ).execute()
+    log.info("Header created on tab=%s", tab)
+
+def append_row(tab: str, row: List[Any]):
+    svc = sheets_service()
+    svc.spreadsheets().values().append(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{tab}!A1",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [row]}
+    ).execute()
+
+def read_table(tab: str) -> Tuple[List[str], List[List[str]]]:
+    svc = sheets_service()
+    res = svc.spreadsheets().values().get(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{tab}!A:Z"
+    ).execute()
+    values = res.get("values") or []
+    if not values:
+        return [], []
+    header = values[0]
+    rows = values[1:]
+    return header, rows
+
+def update_row(tab: str, row_index_1based: int, values: List[Any]):
+    """
+    Updates A.. columns on a specific row.
+    row_index_1based: 2 = first data row
+    """
+    svc = sheets_service()
+    rng = f"{tab}!A{row_index_1based}:Z{row_index_1based}"
+    svc.spreadsheets().values().update(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=rng,
+        valueInputOption="RAW",
+        body={"values": [values]}
+    ).execute()
+
+
+# =============================================================================
+# Sheet schemas
+# =============================================================================
+
+RAW_HEADER = [
+    "timestamp", "symbol", "event", "mapped", "side",
+    "price", "shares", "position_value",
+    "stop_price", "risk_usd",
+    "status", "note", "request_id"
+]
+
+POSITIONS_HEADER = [
+    "symbol", "state",
+    "entry_time", "entry_price",
+    "shares", "position_value",
+    "stop_price", "risk_usd",
+    "last_event", "last_update",
+    "trade_id", "notes"
+]
+
+PNL_HEADER = [
+    "trade_id", "date", "symbol",
+    "entry_time", "exit_time",
+    "entry_price", "exit_price",
+    "shares", "position_value",
+    "gross_pnl", "pnl_per_share",
+    "return_pct", "notes"
+]
+
+DAILY_HEADER = [
+    "date", "trades", "gross_pnl",
+    "wins", "losses", "win_rate",
+    "avg_pnl", "avg_win", "avg_loss"
+]
+
+def init_sheets():
+    if not SHEETS_ON:
+        return
+    ensure_tabs_exist([GOOGLE_SHEET_TAB, POSITIONS_TAB, PNL_TAB, DAILY_TAB, DASHBOARD_TAB])
+    set_header_if_missing(GOOGLE_SHEET_TAB, RAW_HEADER)
+    set_header_if_missing(POSITIONS_TAB, POSITIONS_HEADER)
+    set_header_if_missing(PNL_TAB, PNL_HEADER)
+    set_header_if_missing(DAILY_TAB, DAILY_HEADER)
+
+def dash_write_layout():
+    """
+    Creates a simple dashboard layout with formulas that reference Daily + PnL.
+    """
+    if not SHEETS_ON:
+        return
+    svc = sheets_service()
+
+    # Use USER_ENTERED so formulas work
+    rows = [
+        ["Performance Dashboard"],
+        [""],
+        ["Metric", "Value"],
+        ["All-time Net P&L", f"=IFERROR(SUM({PNL_TAB}!J:J),0)"],
+        ["All-time Trades", f"=IFERROR(COUNTA({PNL_TAB}!A:A)-1,0)"],
+        ["All-time Win Rate", f"=IFERROR(COUNTIF({PNL_TAB}!J:J,\">0\")/(COUNTA({PNL_TAB}!J:J)-1),0)"],
+        ["All-time Avg Trade", f"=IFERROR(AVERAGE({PNL_TAB}!J:J),0)"],
+        ["Today Net P&L", f"=IFERROR(SUMIF({PNL_TAB}!B:B, TEXT(TODAY(),\"yyyy-mm-dd\"), {PNL_TAB}!J:J),0)"],
+        ["Today Trades", f"=IFERROR(COUNTIF({PNL_TAB}!B:B, TEXT(TODAY(),\"yyyy-mm-dd\")),0)"],
+    ]
+
+    svc.spreadsheets().values().update(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{DASHBOARD_TAB}!A1",
+        valueInputOption="USER_ENTERED",
+        body={"values": rows}
+    ).execute()
+
+
+# =============================================================================
+# Positions tab helpers
+# =============================================================================
+
+def pos_get(symbol: str) -> Optional[Dict[str, Any]]:
+    """
+    Returns dict from Positions tab for symbol, including row_index for update.
+    """
+    if not SHEETS_ON:
+        return None
+
+    header, rows = read_table(POSITIONS_TAB)
+    if not header:
+        return None
+
+    idx = {name: i for i, name in enumerate(header)}
+    for i, r in enumerate(rows):
+        sym = (r[idx.get("symbol", 0)] if idx.get("symbol", 0) < len(r) else "").strip().upper()
+        if sym == symbol.upper():
+            out = {}
+            for k, j in idx.items():
+                out[k] = r[j] if j < len(r) else ""
+            out["_row_index_1based"] = i + 2  # header is row 1
+            return out
+    return None
+
+def pos_set(symbol: str, state: str, entry_time: str, entry_price: float, shares: int,
+            position_value: float, stop_price: float, risk_usd: float,
+            last_event: str, trade_id: str, notes: str):
+    if not SHEETS_ON:
+        return
+
+    existing = pos_get(symbol)
+    row = [
+        symbol.upper(),
+        state,
+        entry_time,
+        "" if entry_price is None else entry_price,
+        shares,
+        position_value,
+        stop_price,
+        risk_usd,
+        last_event,
+        now_iso(),
+        trade_id,
+        notes,
+    ]
+
+    if existing and existing.get("_row_index_1based"):
+        update_row(POSITIONS_TAB, int(existing["_row_index_1based"]), row)
+    else:
+        append_row(POSITIONS_TAB, row)
+
+def pos_flat(symbol: str, last_event: str, notes: str):
+    # Keep record but mark FLAT and clear entry fields
+    if not SHEETS_ON:
+        return
+    existing = pos_get(symbol)
+    trade_id = (existing.get("trade_id") if existing else "") or ""
+    row = [
+        symbol.upper(),
+        "FLAT",
+        "", "", "", "", "", "",
+        last_event,
+        now_iso(),
+        trade_id,
+        notes,
+    ]
+    if existing and existing.get("_row_index_1based"):
+        update_row(POSITIONS_TAB, int(existing["_row_index_1based"]), row)
+    else:
+        append_row(POSITIONS_TAB, row)
+
+
+# =============================================================================
+# PnL + Daily recompute
+# =============================================================================
+
+def append_pnl_row(trade_id: str, symbol: str, entry_time: str, exit_time: str,
+                   entry_price: float, exit_price: float, shares: int, position_value: float,
+                   notes: str):
+    gross_pnl = round((exit_price - entry_price) * shares, 2)
+    pnl_per_share = round((exit_price - entry_price), 4)
+    ret_pct = 0.0
+    if entry_price > 0:
+        ret_pct = round(((exit_price - entry_price) / entry_price) * 100.0, 4)
+
+    date_str = datetime.now(timezone.utc).date().isoformat()
+
+    append_row(PNL_TAB, [
+        trade_id, date_str, symbol.upper(),
+        entry_time, exit_time,
+        entry_price, exit_price,
+        shares, round(position_value, 2),
+        gross_pnl, pnl_per_share,
+        ret_pct, notes
+    ])
+
+def recompute_daily_from_pnl():
+    """
+    Rebuilds Daily tab from PnL tab. Simple + reliable.
+    """
+    if not SHEETS_ON:
+        return
+
+    header, rows = read_table(PNL_TAB)
+    if not header:
+        return
+
+    idx = {name: i for i, name in enumerate(header)}
+
+    by_date: Dict[str, Dict[str, Any]] = {}
+
+    for r in rows:
+        if not r or len(r) < 3:
+            continue
+        date_str = r[idx.get("date", 1)] if idx.get("date", 1) < len(r) else ""
+        pnl_str = r[idx.get("gross_pnl", 9)] if idx.get("gross_pnl", 9) < len(r) else "0"
+        try:
+            pnl = float(pnl_str)
+        except:
+            pnl = 0.0
+
+        d = by_date.setdefault(date_str, {
+            "trades": 0,
+            "gross_pnl": 0.0,
+            "wins": 0,
+            "losses": 0,
+            "sum_win": 0.0,
+            "sum_loss": 0.0,
+        })
+        d["trades"] += 1
+        d["gross_pnl"] += pnl
+        if pnl > 0:
+            d["wins"] += 1
+            d["sum_win"] += pnl
+        elif pnl < 0:
+            d["losses"] += 1
+            d["sum_loss"] += pnl
+
+    # Write fresh table: header + sorted dates
+    out = [DAILY_HEADER]
+    for date_str in sorted(by_date.keys()):
+        d = by_date[date_str]
+        trades = d["trades"]
+        gross = round(d["gross_pnl"], 2)
+        wins = d["wins"]
+        losses = d["losses"]
+        win_rate = round((wins / trades) if trades else 0.0, 4)
+        avg_pnl = round((gross / trades) if trades else 0.0, 2)
+        avg_win = round((d["sum_win"] / wins) if wins else 0.0, 2)
+        avg_loss = round((d["sum_loss"] / losses) if losses else 0.0, 2)
+
+        out.append([date_str, trades, gross, wins, losses, win_rate, avg_pnl, avg_win, avg_loss])
+
+    svc = sheets_service()
+    svc.spreadsheets().values().update(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{DAILY_TAB}!A1",
+        valueInputOption="RAW",
+        body={"values": out}
+    ).execute()
+
+
+# =============================================================================
+# Boot Sheets (once)
+# =============================================================================
+if SHEETS_ON:
+    init_sheets()
+    dash_write_layout()
+
+
+# =============================================================================
 # Routes
-# ------------------------------------------------------------------------------
+# =============================================================================
+
 @app.route("/", methods=["GET"])
 def root():
     return "OK", 200
-
 
 @app.route("/health", methods=["GET"])
 def health():
     return "OK", 200
 
-
-@app.route("/tv", methods=["POST"])
+@app.route("/tv", methods=["POST", "GET"])
 def tv():
-    """
-    TradingView webhook endpoint.
+    req_id = str(uuid.uuid4())[:8]
 
-    Example JSON:
-    {
-      "symbol": "AMCI",
-      "event": "BUY" | "SELL" | "ENTRY" | "EXIT",
-      "side": "long",
-      "risk_stop_pct": 2.0,
-      "price": 13.29
-    }
+    if request.method != "POST":
+        return jsonify({"ok": False, "error": "Use POST with JSON body"}), 405
 
-    Notes:
-    - If price is not provided, we will fetch last price from Questrade when not DRY_RUN.
-      In DRY_RUN we prefer you include "price" so simulation is accurate.
-    """
-    raw = request.get_data(as_text=True)
-    log.info("TV raw body: %s", raw[:2000])
+    raw_body = request.get_data(as_text=True)
+    log.info("[%s] /tv raw body: %s", req_id, raw_body[:800])
 
     try:
         data = request.get_json(force=True) or {}
     except Exception as e:
-        log.exception("Bad JSON")
-        return jsonify({"ok": False, "error": "bad_json", "detail": str(e)}), 400
+        log.exception("[%s] JSON parse error", req_id)
+        return jsonify({"ok": False, "error": "Bad JSON", "detail": str(e)}), 400
 
-    # normalize
     symbol = str(data.get("symbol", "")).upper().strip()
     event = str(data.get("event", "")).upper().strip()
     side = str(data.get("side", "long")).lower().strip()
-    risk_stop_pct = float(data.get("risk_stop_pct", 2.0))
-    price_in = data.get("price", None)
-    price = float(price_in) if price_in not in (None, "") else None
+    risk_stop_pct = float(data.get("risk_stop_pct", 2.0) or 2.0)
+
+    # Price should be supplied by TradingView so DRY_RUN doesn't need Questrade.
+    price = data.get("price", None)
+    try:
+        price = float(price) if price is not None else None
+    except:
+        price = None
 
     if not symbol:
-        return jsonify({"ok": False, "error": "missing_symbol"}), 400
+        return jsonify({"ok": False, "error": "Missing symbol"}), 400
 
-    # Map to ENTRY/EXIT (your app logic)
     if side != "long":
-        return jsonify({"ok": False, "error": "only_long_supported"}), 400
+        return jsonify({"ok": False, "error": "Only long side supported"}), 400
 
+    # Map events
+    # Accept BUY/SELL or ENTRY/EXIT
     if event in ("BUY", "ENTRY"):
         mapped = "ENTRY"
     elif event in ("SELL", "EXIT"):
         mapped = "EXIT"
     else:
-        return jsonify({"ok": False, "error": "unsupported_event", "event": event}), 400
+        return jsonify({"ok": False, "error": "Unsupported event", "event": event}), 400
 
-    # ------------------------------------------------------------------
+    # Cooldown check (best effort)
+    cd = cooldown_block(symbol)
+    if cd:
+        log.info("[%s] cooldown blocked: %s", req_id, cd)
+        if SHEETS_ON:
+            append_row(GOOGLE_SHEET_TAB, [
+                now_iso(), symbol, event, mapped, side,
+                price if price is not None else "",
+                "", "", "", "",
+                "cooldown", cd, req_id
+            ])
+        return jsonify({"ok": True, "status": "cooldown", "reason": cd}), 200
+
     # ---- HARD STATE BLOCK (no multiple entry / exit) ----
-    # ------------------------------------------------------------------
     current = pos_get(symbol) if SHEETS_ON else None
     state = (current.get("state") if current else "FLAT") or "FLAT"
 
     if mapped == "ENTRY" and state == "LONG":
-        log.info("ENTRY ignored: already LONG for %s", symbol)
+        log.info("[%s] ENTRY ignored: already LONG for %s", req_id, symbol)
         if SHEETS_ON:
-            append_log_row({
-                "timestamp": now_iso(),
-                "symbol": symbol,
-                "event": event,
-                "side": side,
-                "price": price if price is not None else "",
-                "shares": "",
-                "position_value": "",
-                "stop_price": "",
-                "risk_usd": "",
-                "status": "ignored",
-                "note": "ENTRY ignored: already LONG",
-                "pnl_usd": ""
-            })
-        return jsonify({
-            "ok": True,
-            "ignored": True,
-            "reason": "Already in position (LONG)"
-        }), 200
+            append_row(GOOGLE_SHEET_TAB, [
+                now_iso(), symbol, event, mapped, side,
+                price if price is not None else "",
+                "", "", "", "",
+                "ignored", "Already in position (LONG)", req_id
+            ])
+        return jsonify({"ok": True, "ignored": True, "reason": "Already in position (LONG)"}), 200
 
     if mapped == "EXIT" and state != "LONG":
-        log.info("EXIT ignored: no open position for %s", symbol)
+        log.info("[%s] EXIT ignored: no open position for %s (state=%s)", req_id, symbol, state)
         if SHEETS_ON:
-            append_log_row({
-                "timestamp": now_iso(),
-                "symbol": symbol,
-                "event": event,
-                "side": side,
-                "price": price if price is not None else "",
-                "shares": "",
-                "position_value": "",
-                "stop_price": "",
-                "risk_usd": "",
-                "status": "ignored",
-                "note": "EXIT ignored: no open position",
-                "pnl_usd": ""
-            })
-        return jsonify({
-            "ok": True,
-            "ignored": True,
-            "reason": "No open position to exit"
-        }), 200
+            append_row(GOOGLE_SHEET_TAB, [
+                now_iso(), symbol, event, mapped, side,
+                price if price is not None else "",
+                "", "", "", "",
+                "ignored", "No open position to exit", req_id
+            ])
+        return jsonify({"ok": True, "ignored": True, "reason": "No open position to exit"}), 200
 
-    # ------------------------------------------------------------------
-    # Cooldowns (secondary protection)
-    # ------------------------------------------------------------------
-    cd_reason = cooldown_check(symbol)
-    if cd_reason:
-        log.warning("Cooldown blocked: %s", cd_reason)
-        if SHEETS_ON:
-            append_log_row({
-                "timestamp": now_iso(),
-                "symbol": symbol,
-                "event": event,
-                "side": side,
-                "price": price if price is not None else "",
-                "shares": "",
-                "position_value": "",
-                "stop_price": "",
-                "risk_usd": "",
-                "status": "cooldown",
-                "note": cd_reason,
-                "pnl_usd": ""
-            })
-        return jsonify({"ok": True, "blocked": True, "reason": cd_reason}), 200
-
-    # ------------------------------------------------------------------
-    # Determine price if missing
-    # ------------------------------------------------------------------
+    # We need price for sizing + P&L simulation/logging
     if price is None:
-        if DRY_RUN:
-            # In DRY_RUN we don't want to refresh tokens unless you really want it
-            return jsonify({
-                "ok": False,
-                "error": "missing_price_in_dry_run",
-                "detail": "Include 'price' in your TradingView JSON for accurate dry-run simulation."
-            }), 400
+        note = "Missing price. Include price in TradingView webhook JSON (e.g. using {{close}})."
+        if SHEETS_ON:
+            append_row(GOOGLE_SHEET_TAB, [
+                now_iso(), symbol, event, mapped, side,
+                "", "", "", "", "",
+                "error", note, req_id
+            ])
+        return jsonify({"ok": False, "error": "missing_price", "detail": note}), 400
 
-        # live mode: fetch last price from QT
-        access_token, api_server = qt_refresh_access_token()
-        price = qt_last_price(access_token, api_server, symbol)
+    shares, position_value, risk_usd, sizing_note = calc_shares(price, risk_stop_pct)
+    stop_price = calc_stop_price(price, risk_stop_pct)
 
-    # ------------------------------------------------------------------
-    # Compute sizing
-    # ------------------------------------------------------------------
-    shares, stop_price, risk_usd, position_value, sizing_note = calc_shares_and_risk(price, risk_stop_pct)
+    # Mark cooldown only when we accept the signal (ENTRY/EXIT not ignored)
+    cooldown_mark(symbol)
 
-    # ------------------------------------------------------------------
-    # Execute (DRY_RUN vs LIVE)
-    # ------------------------------------------------------------------
+    # DRY_RUN flow:
     if DRY_RUN:
-        pnl_usd = ""
-        status = "dry_run"
-
         if mapped == "ENTRY":
-            # record position state
+            trade_id = f"{symbol}-{int(time.time())}"
+
+            # Update positions state
             if SHEETS_ON:
-                pos_upsert(
+                pos_set(
                     symbol=symbol,
                     state="LONG",
+                    entry_time=now_iso(),
                     entry_price=price,
                     shares=shares,
-                    entry_value=position_value,
-                    last_event="ENTRY"
+                    position_value=position_value,
+                    stop_price=stop_price,
+                    risk_usd=risk_usd,
+                    last_event="ENTRY",
+                    trade_id=trade_id,
+                    notes=sizing_note
                 )
 
-        if mapped == "EXIT":
-            # compute realized P&L using stored entry
-            entry_price = None
-            entry_shares = None
-            if SHEETS_ON:
-                cur = pos_get(symbol)
-                entry_price = cur.get("entry_price")
-                entry_shares = cur.get("shares")
+                append_row(GOOGLE_SHEET_TAB, [
+                    now_iso(), symbol, event, mapped, side,
+                    price, shares, position_value,
+                    stop_price, risk_usd,
+                    "dry_run", sizing_note, req_id
+                ])
 
-            if entry_price is not None and entry_shares:
-                pnl = (price - float(entry_price)) * int(entry_shares)
-                pnl_usd = round(pnl, 2)
-                sizing_note = f"entry_price={entry_price} exit_price={price} shares={entry_shares}"
-            else:
-                pnl_usd = ""
-                sizing_note = "No stored entry found to compute pnl."
+            return jsonify({
+                "ok": True,
+                "dry_run": True,
+                "mapped": "ENTRY",
+                "symbol": symbol,
+                "price": price,
+                "shares": shares,
+                "position_value": position_value,
+                "stop_price": stop_price,
+                "risk_usd": risk_usd,
+                "note": sizing_note,
+                "request_id": req_id
+            }), 200
+
+        # EXIT in DRY_RUN => compute true P&L from Positions tab
+        elif mapped == "EXIT":
+            if not current:
+                # Shouldn’t happen because state gate checks it, but safe.
+                return jsonify({"ok": True, "ignored": True, "reason": "No position record"}), 200
+
+            try:
+                entry_price = float(current.get("entry_price") or 0)
+                entry_time = current.get("entry_time") or ""
+                entry_shares = int(float(current.get("shares") or 0))
+                trade_id = current.get("trade_id") or f"{symbol}-{int(time.time())}"
+            except:
+                entry_price = 0.0
+                entry_time = ""
+                entry_shares = 0
+                trade_id = current.get("trade_id") or f"{symbol}-{int(time.time())}"
+
+            gross_pnl = round((price - entry_price) * entry_shares, 2) if entry_shares else 0.0
+            notes = f"dry_run_exit_pnl={gross_pnl}"
 
             if SHEETS_ON:
-                pos_upsert(
+                append_row(GOOGLE_SHEET_TAB, [
+                    now_iso(), symbol, event, mapped, side,
+                    price, entry_shares, round(entry_shares * price, 2),
+                    "", "",  # stop/risk not relevant on exit row
+                    "dry_run_exit", notes, req_id
+                ])
+
+                # Write to PnL tab
+                append_pnl_row(
+                    trade_id=trade_id,
                     symbol=symbol,
-                    state="FLAT",
-                    entry_price="",
-                    shares="",
-                    entry_value="",
-                    last_event="EXIT"
+                    entry_time=entry_time,
+                    exit_time=now_iso(),
+                    entry_price=entry_price,
+                    exit_price=price,
+                    shares=entry_shares,
+                    position_value=entry_shares * entry_price,
+                    notes="dry_run"
                 )
 
-        if SHEETS_ON:
-            append_log_row({
-                "timestamp": now_iso(),
+                # Set FLAT
+                pos_flat(symbol, last_event="EXIT", notes="closed in dry_run")
+
+                # Recompute Daily + refresh Dashboard formulas
+                recompute_daily_from_pnl()
+                dash_write_layout()
+
+            return jsonify({
+                "ok": True,
+                "dry_run": True,
+                "mapped": "EXIT",
                 "symbol": symbol,
-                "event": event,
-                "side": side,
-                "price": price,
-                "shares": shares,
-                "position_value": position_value,
-                "stop_price": round(stop_price, 4),
-                "risk_usd": risk_usd,
-                "status": status,
-                "note": sizing_note,
-                "pnl_usd": pnl_usd
-            })
+                "entry_price": entry_price,
+                "exit_price": price,
+                "shares": entry_shares,
+                "gross_pnl": gross_pnl,
+                "request_id": req_id
+            }), 200
 
-        cooldown_mark(symbol)
-
-        return jsonify({
-            "ok": True,
-            "dry_run": True,
-            "symbol": symbol,
-            "event": event,
-            "mapped": mapped,
-            "side": side,
-            "price": price,
-            "shares": shares,
-            "position_value": position_value,
-            "stop_price": round(stop_price, 4),
-            "risk_usd": risk_usd,
-            "pnl_usd": pnl_usd,
-            "note": sizing_note
-        }), 200
-
-    # LIVE
+    # LIVE mode (place real orders)
     try:
-        order_side = "BUY" if mapped == "ENTRY" else "SELL"
+        if mapped == "ENTRY":
+            # BUY
+            broker = qt_place_market_order(symbol, "BUY", shares)
 
-        broker = qt_place_market_order(symbol, order_side, shares)
+            if SHEETS_ON:
+                trade_id = f"{symbol}-{int(time.time())}"
+                pos_set(
+                    symbol=symbol,
+                    state="LONG",
+                    entry_time=now_iso(),
+                    entry_price=price,
+                    shares=shares,
+                    position_value=position_value,
+                    stop_price=stop_price,
+                    risk_usd=risk_usd,
+                    last_event="ENTRY",
+                    trade_id=trade_id,
+                    notes="LIVE: " + sizing_note
+                )
 
-        if SHEETS_ON:
-            # update position state
-            if mapped == "ENTRY":
-                pos_upsert(symbol, "LONG", entry_price=price, shares=shares, entry_value=position_value, last_event="ENTRY")
-            else:
-                pos_upsert(symbol, "FLAT", entry_price="", shares="", entry_value="", last_event="EXIT")
+                append_row(GOOGLE_SHEET_TAB, [
+                    now_iso(), symbol, event, mapped, side,
+                    price, shares, position_value,
+                    stop_price, risk_usd,
+                    "live_entry", "Order sent", req_id
+                ])
 
-            append_log_row({
-                "timestamp": now_iso(),
-                "symbol": symbol,
-                "event": event,
-                "side": side,
-                "price": price,
-                "shares": shares,
-                "position_value": position_value,
-                "stop_price": round(stop_price, 4),
-                "risk_usd": risk_usd,
-                "status": "live",
-                "note": sizing_note,
-                "pnl_usd": ""
-            })
+            return jsonify({"ok": True, "live": True, "mapped": "ENTRY", "broker": broker}), 200
 
-        cooldown_mark(symbol)
+        else:
+            # EXIT => SELL all shares recorded in Positions
+            current = pos_get(symbol) if SHEETS_ON else None
+            entry_shares = shares
+            entry_price = None
+            entry_time = ""
+            trade_id = f"{symbol}-{int(time.time())}"
 
-        return jsonify({
-            "ok": True,
-            "dry_run": False,
-            "symbol": symbol,
-            "event": event,
-            "mapped": mapped,
-            "order_side": order_side,
-            "price": price,
-            "shares": shares,
-            "position_value": position_value,
-            "stop_price": round(stop_price, 4),
-            "risk_usd": risk_usd,
-            "broker_result": broker
-        }), 200
+            if current:
+                try:
+                    entry_shares = int(float(current.get("shares") or shares))
+                    entry_price = float(current.get("entry_price") or 0)
+                    entry_time = current.get("entry_time") or ""
+                    trade_id = current.get("trade_id") or trade_id
+                except:
+                    pass
+
+            broker = qt_place_market_order(symbol, "SELL", entry_shares)
+
+            if SHEETS_ON:
+                append_row(GOOGLE_SHEET_TAB, [
+                    now_iso(), symbol, event, mapped, side,
+                    price, entry_shares, round(entry_shares * price, 2),
+                    "", "",
+                    "live_exit", "Order sent", req_id
+                ])
+
+                if entry_price is not None and entry_shares:
+                    append_pnl_row(
+                        trade_id=trade_id,
+                        symbol=symbol,
+                        entry_time=entry_time,
+                        exit_time=now_iso(),
+                        entry_price=float(entry_price),
+                        exit_price=float(price),
+                        shares=int(entry_shares),
+                        position_value=float(entry_price) * int(entry_shares),
+                        notes="live"
+                    )
+                    recompute_daily_from_pnl()
+                    dash_write_layout()
+
+                pos_flat(symbol, last_event="EXIT", notes="closed live")
+
+            return jsonify({"ok": True, "live": True, "mapped": "EXIT", "broker": broker}), 200
 
     except Exception as e:
-        log.exception("LIVE order failed")
+        log.exception("[%s] live order failed", req_id)
         if SHEETS_ON:
-            append_log_row({
-                "timestamp": now_iso(),
-                "symbol": symbol,
-                "event": event,
-                "side": side,
-                "price": price,
-                "shares": shares,
-                "position_value": position_value,
-                "stop_price": round(stop_price, 4),
-                "risk_usd": risk_usd,
-                "status": "error",
-                "note": str(e),
-                "pnl_usd": ""
-            })
+            append_row(GOOGLE_SHEET_TAB, [
+                now_iso(), symbol, event, mapped, side,
+                price, shares, position_value,
+                stop_price, risk_usd,
+                "error", str(e)[:200], req_id
+            ])
         return jsonify({"ok": False, "error": "order_failed", "detail": str(e)}), 500
 
 
-# ------------------------------------------------------------------------------
-# Entry point for local dev
-# ------------------------------------------------------------------------------
+# =============================================================================
+# Local dev entry point (Render uses gunicorn)
+# =============================================================================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
