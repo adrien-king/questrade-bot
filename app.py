@@ -1,18 +1,16 @@
 import os
 import time
-import uuid
 import json
+import uuid
 import logging
-from datetime import datetime, timezone
-from collections import defaultdict
+from typing import Dict, Any, Optional, Tuple
 
 import requests
-from flask import Flask, request, jsonify, g
+from flask import Flask, request, jsonify
 
-# ==============================================================================
-# Flask + logging setup
-# ==============================================================================
-
+# ------------------------------------------------------------------------------
+# Flask + logging
+# ------------------------------------------------------------------------------
 app = Flask(__name__)
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -20,495 +18,410 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 log = app.logger
 log.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
-# ==============================================================================
+# ------------------------------------------------------------------------------
 # Environment variables
-# ==============================================================================
+# ------------------------------------------------------------------------------
+QUESTRADE_REFRESH_TOKEN = os.getenv("QUESTRADE_REFRESH_TOKEN")  # Questrade refresh token (NOT TradingView token)
+QUESTRADE_ACCOUNT_NUMBER = os.getenv("QUESTRADE_ACCOUNT_NUMBER")
+QUESTRADE_PRACTICE = os.getenv("QUESTRADE_PRACTICE", "1")  # "1" practice, "0" live
 
-QUESTRADE_REFRESH_TOKEN = (os.getenv("QUESTRADE_REFRESH_TOKEN") or "").strip()
-QUESTRADE_ACCOUNT_NUMBER = (os.getenv("QUESTRADE_ACCOUNT_NUMBER") or "").strip()
-QUESTRADE_PRACTICE = (os.getenv("QUESTRADE_PRACTICE", "1") or "1").strip()  # "1"=practice, "0"=live
-
-# Sizing
-POSITION_DOLLARS = float(os.getenv("POSITION_DOLLARS", "1000"))
-MAX_POSITION_USD = float(os.getenv("MAX_POSITION_USD", "0") or "0")  # optional cap
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "50"))  # dollars risked per trade
-USE_RISK_SIZING = (os.getenv("USE_RISK_SIZING", "0") == "1")  # 1 = size by risk, 0 = fixed dollars
-
-# Dry run / paper trading
 DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
-SIM_SLIPPAGE_PCT = float(os.getenv("SIM_SLIPPAGE_PCT", "0.00"))  # e.g. 0.05 = 0.05%
-SIM_FEE_PER_TRADE = float(os.getenv("SIM_FEE_PER_TRADE", "0.00"))  # flat fee in dollars (paper)
+
+# Position sizing
+POSITION_DOLLARS = float(os.getenv("POSITION_DOLLARS", "1000"))
+MAX_POSITION_USD = float(os.getenv("MAX_POSITION_USD", "0") or "0")
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "50"))  # dollars at risk per trade
+USE_RISK_SIZING = os.getenv("USE_RISK_SIZING", "0") == "1"
 
 # Cooldowns (seconds)
 GLOBAL_COOLDOWN_SEC = int(os.getenv("GLOBAL_COOLDOWN_SEC", "0") or "0")
 SYMBOL_COOLDOWN_SEC = int(os.getenv("SYMBOL_COOLDOWN_SEC", "0") or "0")
 
-# Multi-symbol routing: JSON dict like {"PLRZ":"12345678","AAPL":"87654321"}
-ACCOUNT_MAP_JSON = os.getenv("ACCOUNT_MAP_JSON", "").strip()
-ACCOUNT_MAP = {}
-if ACCOUNT_MAP_JSON:
-    try:
-        ACCOUNT_MAP = json.loads(ACCOUNT_MAP_JSON)
-        if not isinstance(ACCOUNT_MAP, dict):
-            ACCOUNT_MAP = {}
-    except Exception:
-        ACCOUNT_MAP = {}
+# Optional: Google Sheets logger (Apps Script "web app" URL)
+GOOGLE_SHEETS_WEBHOOK_URL = os.getenv("GOOGLE_SHEETS_WEBHOOK_URL")  # optional
 
-# Basic validation
-if not QUESTRADE_REFRESH_TOKEN:
-    raise ValueError("Missing Questrade refresh token (QUESTRADE_REFRESH_TOKEN).")
-if not QUESTRADE_ACCOUNT_NUMBER:
-    raise ValueError("Missing Questrade account number (QUESTRADE_ACCOUNT_NUMBER).")
+# Optional auth for your /tv endpoint
+TV_WEBHOOK_SECRET = os.getenv("TV_WEBHOOK_SECRET")  # optional; if set, require header X-Webhook-Secret
 
+# ------------------------------------------------------------------------------
+# In-memory state (Render instances can restart; this is best-effort)
+# ------------------------------------------------------------------------------
+_last_global_trade_ts = 0.0
+_last_symbol_trade_ts: Dict[str, float] = {}
+
+# For DRY_RUN profit simulation: store last "entry" per symbol
+_dry_positions: Dict[str, Dict[str, Any]] = {}
+# example: _dry_positions["AMCI"] = {"side": "long", "shares": 10, "entry_price": 7.12, "ts": ...}
+
+# ------------------------------------------------------------------------------
+# Startup info
+# ------------------------------------------------------------------------------
 log.info(
-    "Config loaded: PRACTICE=%s DRY_RUN=%s USE_RISK_SIZING=%s POSITION_DOLLARS=%.2f RISK_PER_TRADE=%.2f "
-    "MAX_POSITION_USD=%.2f GLOBAL_COOLDOWN_SEC=%s SYMBOL_COOLDOWN_SEC=%s LOG_LEVEL=%s",
-    QUESTRADE_PRACTICE, DRY_RUN, USE_RISK_SIZING, POSITION_DOLLARS, RISK_PER_TRADE,
-    MAX_POSITION_USD, GLOBAL_COOLDOWN_SEC, SYMBOL_COOLDOWN_SEC, LOG_LEVEL
+    "Config loaded: PRACTICE=%s DRY_RUN=%s USE_RISK_SIZING=%s POSITION_DOLLARS=%.2f "
+    "RISK_PER_TRADE=%.2f MAX_POSITION_USD=%.2f GLOBAL_COOLDOWN_SEC=%s SYMBOL_COOLDOWN_SEC=%s LOG_LEVEL=%s",
+    QUESTRADE_PRACTICE,
+    DRY_RUN,
+    USE_RISK_SIZING,
+    POSITION_DOLLARS,
+    RISK_PER_TRADE,
+    MAX_POSITION_USD,
+    GLOBAL_COOLDOWN_SEC,
+    SYMBOL_COOLDOWN_SEC,
+    LOG_LEVEL,
 )
 
-# ==============================================================================
-# In-memory paper trading state (DRY_RUN)
-# ==============================================================================
+# Validate Questrade config only if we might place live orders
+if not DRY_RUN:
+    if not QUESTRADE_REFRESH_TOKEN:
+        raise ValueError("Missing Questrade refresh token (QUESTRADE_REFRESH_TOKEN).")
+    if not QUESTRADE_ACCOUNT_NUMBER:
+        raise ValueError("Missing Questrade account number (QUESTRADE_ACCOUNT_NUMBER).")
 
-# Per symbol: shares + avg entry
-PAPER_POSITIONS = defaultdict(lambda: {"shares": 0, "avg_price": 0.0, "last_entry_ts": 0.0})
-PAPER_REALIZED_PNL = 0.0
-PAPER_TRADES = []  # recent trade records (keep small)
 
-MAX_PAPER_TRADES = int(os.getenv("MAX_PAPER_TRADES", "200") or "200")
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
+def _now() -> float:
+    return time.time()
 
-# Cooldown tracking
-LAST_ACTION_TS_GLOBAL = 0.0
-LAST_ACTION_TS_BY_SYMBOL = defaultdict(lambda: 0.0)
 
-# ==============================================================================
-# Helpers: misc
-# ==============================================================================
+def _json_safe(obj: Any, maxlen: int = 2000) -> str:
+    try:
+        s = json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        s = str(obj)
+    return s if len(s) <= maxlen else s[:maxlen] + "...(truncated)"
 
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
 
-def _safe_text(s: str, limit: int = 500) -> str:
-    s = s or ""
-    s = s.replace("\n", "\\n")
-    return s[:limit]
-
-def _redact(s: str) -> str:
-    # basic redaction for tokens if ever logged
+def _mask(s: Optional[str], keep: int = 6) -> str:
     if not s:
-        return s
-    # Don’t try to be perfect; just avoid obvious leaks
-    return s.replace(QUESTRADE_REFRESH_TOKEN, "[REDACTED_REFRESH_TOKEN]") if QUESTRADE_REFRESH_TOKEN else s
+        return ""
+    if len(s) <= keep:
+        return "*" * len(s)
+    return s[:keep] + "*" * (len(s) - keep)
 
-def _account_for_symbol(symbol: str) -> str:
-    # Multi-symbol routing
-    mapped = ACCOUNT_MAP.get(symbol)
-    return str(mapped).strip() if mapped else QUESTRADE_ACCOUNT_NUMBER
-
-def _apply_slippage(price: float, action: str) -> float:
-    # action: BUY or SELL
-    if SIM_SLIPPAGE_PCT <= 0:
-        return price
-    slip = price * (SIM_SLIPPAGE_PCT / 100.0)
-    return price + slip if action == "BUY" else price - slip
-
-def _cooldown_ok(symbol: str) -> (bool, str):
-    global LAST_ACTION_TS_GLOBAL
-    now = time.time()
-
-    if GLOBAL_COOLDOWN_SEC > 0:
-        remaining = (LAST_ACTION_TS_GLOBAL + GLOBAL_COOLDOWN_SEC) - now
-        if remaining > 0:
-            return False, f"Global cooldown active ({remaining:.1f}s remaining)"
-
-    if SYMBOL_COOLDOWN_SEC > 0:
-        last = LAST_ACTION_TS_BY_SYMBOL[symbol]
-        remaining = (last + SYMBOL_COOLDOWN_SEC) - now
-        if remaining > 0:
-            return False, f"Symbol cooldown active for {symbol} ({remaining:.1f}s remaining)"
-
-    return True, ""
-
-def _cooldown_mark(symbol: str):
-    global LAST_ACTION_TS_GLOBAL
-    ts = time.time()
-    LAST_ACTION_TS_GLOBAL = ts
-    LAST_ACTION_TS_BY_SYMBOL[symbol] = ts
-
-# ==============================================================================
-# Questrade helpers
-# ==============================================================================
 
 def _login_base_url() -> str:
     return "https://login.questrade.com"
 
-def qt_refresh_access_token():
-    url = f"{_login_base_url()}/oauth2/token"
-    params = {
-        "grant_type": "refresh_token",
-        "refresh_token": QUESTRADE_REFRESH_TOKEN,
-    }
 
-    token_prefix = (QUESTRADE_REFRESH_TOKEN or "")[:5]
-    log.info("qt_refresh_access_token: refreshing token token_prefix=%s...", token_prefix)
+def qt_refresh_access_token() -> Tuple[str, str]:
+    """
+    Refresh token -> access_token + api_server
+    """
+    assert QUESTRADE_REFRESH_TOKEN, "QUESTRADE_REFRESH_TOKEN missing"
+    url = f"{_login_base_url()}/oauth2/token?grant_type=refresh_token&refresh_token={QUESTRADE_REFRESH_TOKEN}"
 
-    r = requests.get(url, params=params, timeout=20)
+    log.info("QT refresh: GET %s token_prefix=%s...", _login_base_url(), _mask(QUESTRADE_REFRESH_TOKEN, 6))
+    r = requests.get(url, timeout=20)
 
-    log.info("qt_refresh_access_token: status=%s body=%s", r.status_code, r.text[:400])
+    # Log small snippet only (avoid dumping secrets)
+    body_snip = (r.text or "")[:500]
+    log.info("QT refresh response: status=%s body=%s", r.status_code, body_snip)
 
     if r.status_code != 200:
-        raise Exception(f"Failed to refresh token: status={r.status_code} body={r.text}")
+        raise Exception(f"Failed to refresh token: status={r.status_code} body={body_snip}")
 
     data = r.json()
-    return data["access_token"], data["api_server"]
-    
-def qt_headers(access_token: str) -> dict:
+    access_token = data["access_token"]
+    api_server = data["api_server"]  # e.g. "https://api01.iq.questrade.com/"
+    return access_token, api_server
+
+
+def qt_headers(access_token: str) -> Dict[str, str]:
     return {"Authorization": f"Bearer {access_token}"}
+
 
 def qt_get_symbol_id(access_token: str, api_server: str, symbol: str) -> int:
     url = f"{api_server}v1/symbols/search?prefix={symbol}"
-    log.info("[%s] qt_get_symbol_id: GET %s", g.request_id, url)
-
     r = requests.get(url, headers=qt_headers(access_token), timeout=20)
-    body = _safe_text(r.text, 600)
-    log.info("[%s] qt_get_symbol_id: status=%s body=%s", g.request_id, r.status_code, body)
-
     if r.status_code != 200:
-        raise Exception(f"Failed to lookup symbolId for {symbol}: status={r.status_code} body={body}")
-
+        raise Exception(f"Failed symbol search: {symbol} status={r.status_code} body={(r.text or '')[:500]}")
     data = r.json()
     symbols = data.get("symbols", [])
     if not symbols:
-        raise Exception(f"No symbols found for {symbol} (body={body})")
-
+        raise Exception(f"No symbols found for {symbol}")
     exact = [s for s in symbols if s.get("symbol") == symbol]
-    chosen = (exact[0] if exact else symbols[0])
+    chosen = exact[0] if exact else symbols[0]
     return int(chosen["symbolId"])
 
-def get_last_price(access_token: str, api_server: str, symbol: str) -> float:
+
+def qt_get_last_price(access_token: str, api_server: str, symbol: str) -> float:
     url = f"{api_server}v1/markets/quotes/{symbol}"
-    log.info("[%s] get_last_price: GET %s", g.request_id, url)
-
     r = requests.get(url, headers=qt_headers(access_token), timeout=20)
-    body = _safe_text(r.text, 600)
-    log.info("[%s] get_last_price: status=%s body=%s", g.request_id, r.status_code, body)
-
     if r.status_code != 200:
-        raise Exception(f"Failed to get last price for {symbol}: status={r.status_code} body={body}")
-
+        raise Exception(f"Failed quote: {symbol} status={r.status_code} body={(r.text or '')[:500]}")
     data = r.json()
     return float(data["quotes"][0]["lastTradePrice"])
 
-def calc_shares(last_price: float, risk_stop_pct: float) -> int:
+
+def _compute_shares(
+    price: float,
+    risk_stop_pct: float,
+) -> int:
     """
-    Two sizing modes:
-      - fixed notional: POSITION_DOLLARS / last_price
-      - risk sizing: RISK_PER_TRADE / (last_price * risk_stop_pct%)
+    If USE_RISK_SIZING=1:
+      shares = floor(RISK_PER_TRADE / (price * risk_stop_pct/100))
+    Else:
+      shares = floor(POSITION_DOLLARS / price)
+
+    Always min 1 share.
     """
-    if last_price <= 0:
-        return 0
+    if price <= 0:
+        return 1
 
     if USE_RISK_SIZING:
-        stop_dist = last_price * (max(0.0001, risk_stop_pct) / 100.0)
-        raw = int(RISK_PER_TRADE // stop_dist) if stop_dist > 0 else 0
-        shares = max(1, raw)
-    else:
-        shares = max(1, int(POSITION_DOLLARS // last_price))
+        stop_dollars_per_share = price * (risk_stop_pct / 100.0)
+        if stop_dollars_per_share <= 0:
+            return max(1, int(POSITION_DOLLARS / price))
+        shares = int(RISK_PER_TRADE / stop_dollars_per_share)
+        return max(1, shares)
 
-    # optional max notional cap
-    if MAX_POSITION_USD > 0:
-        max_shares = int(MAX_POSITION_USD // last_price)
-        shares = max(1, min(shares, max_shares))
+    return max(1, int(POSITION_DOLLARS / price))
 
-    return shares
 
-def qt_place_order(symbol: str, action: str, risk_stop_pct: float):
+def _stop_price_for_long(entry_price: float, risk_stop_pct: float) -> float:
+    return round(entry_price * (1.0 - risk_stop_pct / 100.0), 4)
+
+
+def _check_cooldowns(symbol: str) -> Optional[str]:
+    global _last_global_trade_ts
+    now = _now()
+
+    if GLOBAL_COOLDOWN_SEC > 0:
+        if now - _last_global_trade_ts < GLOBAL_COOLDOWN_SEC:
+            return f"Global cooldown active ({GLOBAL_COOLDOWN_SEC}s)."
+
+    if SYMBOL_COOLDOWN_SEC > 0:
+        last = _last_symbol_trade_ts.get(symbol, 0.0)
+        if now - last < SYMBOL_COOLDOWN_SEC:
+            return f"Symbol cooldown active for {symbol} ({SYMBOL_COOLDOWN_SEC}s)."
+
+    return None
+
+
+def _mark_trade(symbol: str):
+    global _last_global_trade_ts
+    now = _now()
+    _last_global_trade_ts = now
+    _last_symbol_trade_ts[symbol] = now
+
+
+def _log_to_google_sheets(payload: Dict[str, Any]):
     """
-    action: "BUY" or "SELL"
-    Places a market order.
+    Optional: send a JSON payload to your Apps Script Web App endpoint.
+    """
+    if not GOOGLE_SHEETS_WEBHOOK_URL:
+        return
+    try:
+        requests.post(GOOGLE_SHEETS_WEBHOOK_URL, json=payload, timeout=10)
+    except Exception:
+        log.exception("Google Sheets logging failed (non-fatal)")
+
+
+def qt_place_market_order(symbol: str, is_buy: bool, shares: int) -> Dict[str, Any]:
+    """
+    Live: place a Market Day order.
     """
     access_token, api_server = qt_refresh_access_token()
     symbol_id = qt_get_symbol_id(access_token, api_server, symbol)
-    last_price = get_last_price(access_token, api_server, symbol)
-
-    shares = calc_shares(last_price, risk_stop_pct)
-
-    account_number = _account_for_symbol(symbol)
-
-    leg_side = "Buy" if action == "BUY" else "Sell"
 
     order_body = {
-        "accountNumber": account_number,
+        "accountNumber": QUESTRADE_ACCOUNT_NUMBER,
         "orderType": "Market",
         "timeInForce": "Day",
         "primaryRoute": "AUTO",
         "secondaryRoute": "AUTO",
         "isAllOrNone": False,
         "isAnonymous": False,
-        "orderLegs": [{"symbolId": symbol_id, "legSide": leg_side, "quantity": shares}],
+        "orderLegs": [
+            {
+                "symbolId": symbol_id,
+                "legSide": "Buy" if is_buy else "Sell",
+                "quantity": shares,
+            }
+        ],
     }
 
-    url = f"{api_server}v1/accounts/{account_number}/orders"
-    log.info("[%s] qt_place_order: %s %s shares=%s last_price=%.4f risk_stop_pct=%.2f url=%s body=%s",
-             g.request_id, action, symbol, shares, last_price, risk_stop_pct, url, order_body)
-
+    url = f"{api_server}v1/accounts/{QUESTRADE_ACCOUNT_NUMBER}/orders"
     r = requests.post(url, headers=qt_headers(access_token), json=order_body, timeout=20)
-    body = _safe_text(r.text, 900)
-    log.info("[%s] qt_place_order: response status=%s body=%s", g.request_id, r.status_code, body)
 
     if r.status_code >= 300:
-        raise Exception(f"Order rejected: status={r.status_code} body={body}")
+        raise Exception(f"Order rejected: status={r.status_code} body={(r.text or '')[:800]}")
 
     return r.json()
 
-# ==============================================================================
-# DRY_RUN simulator (paper positions + P&L)
-# ==============================================================================
 
-def paper_entry(symbol: str, price: float, risk_stop_pct: float) -> dict:
-    global PAPER_REALIZED_PNL
-
-    fill_price = _apply_slippage(price, "BUY")
-    shares = calc_shares(fill_price, risk_stop_pct)
-    pos = PAPER_POSITIONS[symbol]
-
-    old_shares = pos["shares"]
-    old_avg = pos["avg_price"]
-
-    new_shares = old_shares + shares
-    new_avg = ((old_shares * old_avg) + (shares * fill_price)) / new_shares
-
-    pos["shares"] = new_shares
-    pos["avg_price"] = new_avg
-    pos["last_entry_ts"] = time.time()
-
-    record = {
-        "ts": now_iso(),
-        "symbol": symbol,
-        "action": "BUY",
-        "shares": shares,
-        "fill_price": round(fill_price, 6),
-        "new_position_shares": new_shares,
-        "new_position_avg": round(new_avg, 6),
-    }
-    PAPER_TRADES.append(record)
-    del PAPER_TRADES[:-MAX_PAPER_TRADES]
-
-    log.info("[%s] [DRY_RUN ENTRY] %s +%s @ %.4f -> pos=%s @ %.4f (risk_stop_pct=%.2f USE_RISK_SIZING=%s)",
-             g.request_id, symbol, shares, fill_price, new_shares, new_avg, risk_stop_pct, USE_RISK_SIZING)
-
-    return record
-
-def paper_exit(symbol: str, price: float) -> dict:
-    global PAPER_REALIZED_PNL
-
-    pos = PAPER_POSITIONS[symbol]
-    shares = pos["shares"]
-    entry = pos["avg_price"]
-
-    if shares <= 0:
-        record = {"ts": now_iso(), "symbol": symbol, "action": "EXIT", "note": "no_position"}
-        PAPER_TRADES.append(record)
-        del PAPER_TRADES[:-MAX_PAPER_TRADES]
-        log.info("[%s] [DRY_RUN EXIT] %s no open paper position", g.request_id, symbol)
-        return record
-
-    fill_price = _apply_slippage(price, "SELL")
-
-    gross = (fill_price - entry) * shares
-    net = gross - float(SIM_FEE_PER_TRADE)
-    PAPER_REALIZED_PNL += net
-
-    record = {
-        "ts": now_iso(),
-        "symbol": symbol,
-        "action": "EXIT",
-        "shares": shares,
-        "entry_avg": round(entry, 6),
-        "exit_price": round(fill_price, 6),
-        "gross_pnl": round(gross, 2),
-        "fee": round(float(SIM_FEE_PER_TRADE), 2),
-        "net_pnl": round(net, 2),
-        "realized_pnl_total": round(PAPER_REALIZED_PNL, 2),
-    }
-    PAPER_TRADES.append(record)
-    del PAPER_TRADES[:-MAX_PAPER_TRADES]
-
-    PAPER_POSITIONS[symbol] = {"shares": 0, "avg_price": 0.0, "last_entry_ts": 0.0}
-
-    log.info("[%s] [DRY_RUN EXIT] %s -%s @ %.4f (entry %.4f) net_pnl=%.2f total=%.2f",
-             g.request_id, symbol, shares, fill_price, entry, net, PAPER_REALIZED_PNL)
-
-    return record
-
-def paper_unrealized(symbol: str, mark: float) -> float:
-    pos = PAPER_POSITIONS[symbol]
-    if pos["shares"] <= 0:
-        return 0.0
-    return (mark - pos["avg_price"]) * pos["shares"]
-
-# ==============================================================================
-# Request hooks
-# ==============================================================================
-
-@app.before_request
-def _before():
-    g.request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())[:8]
-    g.start_ts = time.time()
-
-@app.after_request
-def _after(resp):
-    dur_ms = int((time.time() - g.start_ts) * 1000)
-    resp.headers["X-Request-Id"] = g.request_id
-    log.info("[%s] %s %s -> %s (%sms)", g.request_id, request.method, request.path, resp.status_code, dur_ms)
-    return resp
-
-# ==============================================================================
+# ------------------------------------------------------------------------------
 # Routes
-# ==============================================================================
-
+# ------------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
     return "OK", 200
 
-@app.route("/status", methods=["GET"])
-def status():
-    """
-    Shows paper positions + realized P&L (useful in DRY_RUN).
-    """
-    if not DRY_RUN:
-        return jsonify({"ok": True, "mode": "live", "note": "paper status is primarily for DRY_RUN"}), 200
 
-    # compute unrealized using latest known prices only if user supplies ?mark=SYMBOL:PRICE,...
-    marks = {}
-    mark_q = (request.args.get("mark") or "").strip()
-    # example: ?mark=PLRZ:1.23,KALA:5.67
-    if mark_q:
-        for chunk in mark_q.split(","):
-            try:
-                sym, px = chunk.split(":")
-                marks[sym.upper().strip()] = float(px)
-            except Exception:
-                pass
-
-    positions_out = {}
-    unreal_total = 0.0
-    for sym, pos in PAPER_POSITIONS.items():
-        if pos["shares"] <= 0:
-            continue
-        mark = marks.get(sym)
-        u = paper_unrealized(sym, mark) if mark is not None else None
-        if u is not None:
-            unreal_total += u
-        positions_out[sym] = {
-            "shares": pos["shares"],
-            "avg_price": pos["avg_price"],
-            "unrealized": (round(u, 2) if u is not None else None),
-        }
-
-    return jsonify({
-        "ok": True,
-        "dry_run": True,
-        "realized_pnl": round(PAPER_REALIZED_PNL, 2),
-        "unrealized_pnl_total": (round(unreal_total, 2) if marks else None),
-        "positions": positions_out,
-        "recent_trades": PAPER_TRADES[-30:],
-        "use_risk_sizing": USE_RISK_SIZING,
-        "risk_per_trade": RISK_PER_TRADE,
-        "position_dollars": POSITION_DOLLARS,
-        "sim_slippage_pct": SIM_SLIPPAGE_PCT,
-        "sim_fee_per_trade": SIM_FEE_PER_TRADE,
-    }), 200
-
-@app.route("/tv", methods=["GET", "POST"])
+@app.route("/tv", methods=["POST", "GET"])
 def tv():
-    """
-    TradingView webhook endpoint.
-
-    JSON example:
-    {
-      "symbol": "PLRZ",
-      "event": "BUY" | "ENTRY" | "SELL" | "EXIT",
-      "side": "long",
-      "risk_stop_pct": 2.0
-    }
-    """
-    raw_body = request.get_data(as_text=True)
-    log.info("[%s] TV raw body: %s", g.request_id, _safe_text(raw_body, 1200))
+    req_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())[:8]
 
     if request.method != "POST":
         return jsonify({"ok": False, "error": "Use POST with JSON body"}), 405
 
+    # Optional shared secret
+    if TV_WEBHOOK_SECRET:
+        got = request.headers.get("X-Webhook-Secret", "")
+        if got != TV_WEBHOOK_SECRET:
+            log.warning("[%s] Unauthorized webhook (bad secret)", req_id)
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    raw_body = request.get_data(as_text=True) or ""
+    log.info("[%s] /tv raw body: %s", req_id, raw_body[:2000])
+
     try:
         data = request.get_json(force=True) or {}
     except Exception as e:
-        log.exception("[%s] TV JSON parse error", g.request_id)
+        log.exception("[%s] JSON parse error", req_id)
         return jsonify({"ok": False, "error": "Bad JSON", "detail": str(e)}), 400
 
+    # Expected payload (recommended: include price!)
+    # {
+    #   "symbol":"AMCI",
+    #   "event":"BUY"|"SELL"|"ENTRY"|"EXIT",
+    #   "side":"long",
+    #   "risk_stop_pct": 2.0,
+    #   "price": 7.12   <-- strongly recommended for DRY_RUN profit calc
+    # }
     symbol = str(data.get("symbol", "")).upper().strip()
     event = str(data.get("event", "")).upper().strip()
     side = str(data.get("side", "")).lower().strip()
     risk_stop_pct = float(data.get("risk_stop_pct", 2.0))
 
-    log.info("[%s] TV parsed -> symbol=%s event=%s side=%s risk_stop_pct=%.2f DRY_RUN=%s",
-             g.request_id, symbol, event, side, risk_stop_pct, DRY_RUN)
+    # Optional: price from TradingView alert placeholders
+    price = data.get("price", None)
+    try:
+        price = float(price) if price is not None else None
+    except Exception:
+        price = None
+
+    log.info(
+        "[%s] parsed: symbol=%s event=%s side=%s risk_stop_pct=%s price=%s DRY_RUN=%s",
+        req_id, symbol, event, side, risk_stop_pct, price, DRY_RUN
+    )
 
     if not symbol:
         return jsonify({"ok": False, "error": "Missing symbol", "received": data}), 400
 
-    # Map TradingView event to action
-    action = None  # BUY or SELL
+    # Map event+side -> action BUY/SELL for long-only
+    action = None
     if side == "long" and event in ("BUY", "ENTRY"):
         action = "BUY"
     elif side == "long" and event in ("SELL", "EXIT"):
         action = "SELL"
     else:
-        log.warning("[%s] Unsupported combo event=%s side=%s", g.request_id, event, side)
         return jsonify({"ok": False, "error": "Unsupported event/side combo", "event": event, "side": side}), 400
 
-    # Cooldown protection
-    ok, why = _cooldown_ok(symbol)
-    if not ok:
-        log.warning("[%s] Cooldown blocked %s %s: %s", g.request_id, action, symbol, why)
-        return jsonify({"ok": False, "error": "cooldown", "detail": why}), 429
+    # Cooldowns
+    cd = _check_cooldowns(symbol)
+    if cd:
+        log.warning("[%s] cooldown blocked: %s", req_id, cd)
+        return jsonify({"ok": False, "error": "cooldown", "detail": cd}), 429
 
-    # DRY RUN: simulate fills + P&L
+    # --------------------------------------------------------------------------
+    # DRY RUN: RETURN BEFORE ANY QUESTRADE CALLS
+    # --------------------------------------------------------------------------
     if DRY_RUN:
-        try:
-            # We still fetch a price from Questrade for realism (you can remove this if you want)
-            access_token, api_server = qt_refresh_access_token()
-            last_price = get_last_price(access_token, api_server, symbol)
+        # Simulate shares using either risk sizing or fixed notional.
+        # For simulation we need a price. If not provided, we can't compute shares/profit.
+        sim_shares = None
+        sim_stop_price = None
 
-            if action == "BUY":
-                rec = paper_entry(symbol, last_price, risk_stop_pct)
-            else:
-                rec = paper_exit(symbol, last_price)
+        if price is not None and price > 0:
+            sim_shares = _compute_shares(price, risk_stop_pct)
+            sim_stop_price = _stop_price_for_long(price, risk_stop_pct)
 
-            _cooldown_mark(symbol)
+        # Profit simulation: if we have a stored entry and this is an EXIT, compute PnL
+        sim_pnl = None
+        sim_entry = _dry_positions.get(symbol)
 
-            return jsonify({
-                "ok": True,
-                "dry_run": True,
-                "symbol": symbol,
-                "event": event,
-                "side": side,
-                "mapped_action": action,
-                "risk_stop_pct": risk_stop_pct,
-                "last_price": last_price,
-                "paper_result": rec
-            }), 200
+        if action == "BUY":
+            if price is not None and sim_shares is not None:
+                _dry_positions[symbol] = {
+                    "side": "long",
+                    "shares": sim_shares,
+                    "entry_price": price,
+                    "ts": _now(),
+                }
+        elif action == "SELL":
+            if sim_entry and price is not None:
+                # Long PnL = (exit - entry) * shares
+                sim_pnl = round((price - float(sim_entry["entry_price"])) * int(sim_entry["shares"]), 4)
+                # clear position on exit
+                _dry_positions.pop(symbol, None)
 
-        except Exception as e:
-            log.exception("[%s] DRY_RUN error", g.request_id)
-            return jsonify({"ok": False, "error": "dry_run_failed", "detail": str(e)}), 500
+        _mark_trade(symbol)
 
-    # LIVE: place order
+        resp = {
+            "ok": True,
+            "dry_run": True,
+            "symbol": symbol,
+            "event": event,
+            "side": side,
+            "mapped_action": action,
+            "risk_stop_pct": risk_stop_pct,
+            "use_risk_sizing": USE_RISK_SIZING,
+            "risk_per_trade": RISK_PER_TRADE,
+            "position_dollars": POSITION_DOLLARS,
+            "price": price,
+            "sim_shares": sim_shares,
+            "sim_stop_price": sim_stop_price,
+            "sim_position_value": (round(sim_shares * price, 4) if (sim_shares and price) else None),
+            "sim_pnl": sim_pnl,
+            "note": (
+                "For best dry-run sizing & profit simulation, include price in your TradingView alert JSON "
+                "(e.g., using placeholders like {{close}})."
+            ),
+            "received": data,
+        }
+
+        log.info("[%s] DRY_RUN response: %s", req_id, _json_safe(resp))
+        _log_to_google_sheets({"req_id": req_id, "ts": int(_now()), "type": "dry_run", **resp})
+
+        return jsonify(resp), 200
+
+    # --------------------------------------------------------------------------
+    # LIVE ORDER FLOW (Questrade calls happen only here)
+    # --------------------------------------------------------------------------
     try:
-        result = qt_place_order(symbol, action, risk_stop_pct)
-        _cooldown_mark(symbol)
+        if not QUESTRADE_REFRESH_TOKEN or not QUESTRADE_ACCOUNT_NUMBER:
+            return jsonify({"ok": False, "error": "missing_broker_config"}), 500
 
-        return jsonify({
+        # For live sizing, we can use either webhook price OR quote from Questrade
+        use_price = price
+        qt_access_token, qt_api_server = qt_refresh_access_token()
+
+        if use_price is None:
+            use_price = qt_get_last_price(qt_access_token, qt_api_server, symbol)
+
+        shares = _compute_shares(float(use_price), risk_stop_pct)
+
+        # safety cap
+        notional = float(use_price) * shares
+        if MAX_POSITION_USD > 0 and notional > MAX_POSITION_USD:
+            raise Exception(f"Notional ${notional:.2f} exceeds MAX_POSITION_USD=${MAX_POSITION_USD:.2f}")
+
+        stop_price = _stop_price_for_long(float(use_price), risk_stop_pct)
+
+        log.info(
+            "[%s] LIVE: action=%s symbol=%s price=%.4f shares=%s notional=%.2f stop=%.4f",
+            req_id, action, symbol, float(use_price), shares, notional, stop_price
+        )
+
+        # Place market order
+        result = qt_place_market_order(symbol, is_buy=(action == "BUY"), shares=shares)
+
+        _mark_trade(symbol)
+
+        resp = {
             "ok": True,
             "dry_run": False,
             "symbol": symbol,
@@ -516,17 +429,27 @@ def tv():
             "side": side,
             "mapped_action": action,
             "risk_stop_pct": risk_stop_pct,
+            "use_risk_sizing": USE_RISK_SIZING,
+            "risk_per_trade": RISK_PER_TRADE,
+            "position_dollars": POSITION_DOLLARS,
+            "price_used": float(use_price),
+            "shares": shares,
+            "notional": round(notional, 4),
+            "computed_stop_price": stop_price,
             "broker_result": result,
-        }), 200
+        }
+
+        _log_to_google_sheets({"req_id": req_id, "ts": int(_now()), "type": "live", **resp})
+        return jsonify(resp), 200
 
     except Exception as e:
-        log.exception("[%s] LIVE order failed", g.request_id)
+        log.exception("[%s] LIVE error", req_id)
         return jsonify({"ok": False, "error": "order_failed", "detail": str(e)}), 500
 
-# ==============================================================================
-# Entry point for local dev (Render uses gunicorn)
-# ==============================================================================
 
+# ------------------------------------------------------------------------------
+# Local entrypoint (Render uses gunicorn)
+# ------------------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
