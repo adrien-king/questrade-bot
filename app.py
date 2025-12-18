@@ -1,3 +1,4 @@
+# app.py
 import os
 import time
 import uuid
@@ -13,12 +14,14 @@ from flask import Flask, request, jsonify
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+
 # =============================================================================
 # Flask + logging
 # =============================================================================
 app = Flask(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = app.logger
+
 
 # =============================================================================
 # ENV / CONFIG
@@ -27,7 +30,7 @@ log = app.logger
 # --- Questrade ---
 QUESTRADE_REFRESH_TOKEN = os.getenv("QUESTRADE_REFRESH_TOKEN", "").strip()
 QUESTRADE_ACCOUNT_NUMBER = os.getenv("QUESTRADE_ACCOUNT_NUMBER", "").strip()
-PRACTICE = os.getenv("QUESTRADE_PRACTICE", "1").strip()  # "1" practice, "0" live
+PRACTICE = os.getenv("QUESTRADE_PRACTICE", "1").strip()  # "1" practice, "0" live (your own conventions)
 
 # --- Bot behavior ---
 DRY_RUN = os.getenv("DRY_RUN", "1").strip() == "1"
@@ -38,6 +41,9 @@ MAX_POSITION_USD = float(os.getenv("MAX_POSITION_USD", "0") or "0")
 
 GLOBAL_COOLDOWN_SEC = int(os.getenv("GLOBAL_COOLDOWN_SEC", "0") or "0")
 SYMBOL_COOLDOWN_SEC = int(os.getenv("SYMBOL_COOLDOWN_SEC", "0") or "0")
+
+# Optional safety: block EXIT if webhook symbol doesn't match open position symbol
+BLOCK_SYMBOL_MISMATCH = os.getenv("BLOCK_SYMBOL_MISMATCH", "1").strip() == "1"
 
 # --- Sheets ---
 SHEETS_ON = os.getenv("SHEETS_ON", "0").strip() == "1"
@@ -51,11 +57,12 @@ DASHBOARD_TAB = os.getenv("DASHBOARD_TAB", "Dashboard").strip()
 # Path to Render secret file (recommended) e.g. /etc/secrets/google_creds.json
 GOOGLE_CREDS_PATH = os.getenv("GOOGLE_CREDS_PATH", "/etc/secrets/google_creds.json").strip()
 
-# IMPORTANT: schema repair switch (only used if you explicitly flip it)
+# IMPORTANT: schema repair switch (you already set this back to 0 after reset)
 FORCE_RESET_SHEETS = os.getenv("FORCE_RESET_SHEETS", "0").strip() == "1"
 
-# Setup endpoint secret token
-SETUP_TOKEN = os.getenv("SETUP_TOKEN", "").strip()
+# IMPORTANT: bot-managed formulas mode
+# If true: bot writes formulas into Daily + Dashboard so they always auto-update from PnL.
+SHEETS_FORMULAS_MODE = os.getenv("SHEETS_FORMULAS_MODE", "1").strip() == "1"
 
 if SHEETS_ON and (not GOOGLE_SHEET_ID):
     raise ValueError("SHEETS_ON=1 but GOOGLE_SHEET_ID is missing.")
@@ -66,12 +73,13 @@ if SHEETS_ON and (not os.path.exists(GOOGLE_CREDS_PATH)):
 log.info(
     "Config loaded: PRACTICE=%s DRY_RUN=%s USE_RISK_SIZING=%s POSITION_DOLLARS=%.2f RISK_PER_TRADE=%.2f "
     "MAX_POSITION_USD=%.2f GLOBAL_COOLDOWN_SEC=%s SYMBOL_COOLDOWN_SEC=%s SHEETS_ON=%s SHEET_ID=%s SHEET_TAB=%s "
-    "GOOGLE_CREDS_PATH=%s FORCE_RESET_SHEETS=%s SETUP_TOKEN_SET=%s",
+    "GOOGLE_CREDS_PATH=%s FORCE_RESET_SHEETS=%s SHEETS_FORMULAS_MODE=%s",
     PRACTICE, DRY_RUN, USE_RISK_SIZING, POSITION_DOLLARS, RISK_PER_TRADE, MAX_POSITION_USD,
     GLOBAL_COOLDOWN_SEC, SYMBOL_COOLDOWN_SEC,
     SHEETS_ON, (GOOGLE_SHEET_ID[:6] + "...") if GOOGLE_SHEET_ID else "", GOOGLE_SHEET_TAB,
-    GOOGLE_CREDS_PATH, FORCE_RESET_SHEETS, bool(SETUP_TOKEN)
+    GOOGLE_CREDS_PATH, FORCE_RESET_SHEETS, SHEETS_FORMULAS_MODE
 )
+
 
 # =============================================================================
 # Questrade helpers
@@ -143,6 +151,7 @@ def qt_place_market_order(symbol: str, action: str, shares: int) -> dict:
         raise Exception(f"Order rejected: {r.status_code} {r.text[:500]}")
     return r.json()
 
+
 # =============================================================================
 # Position sizing / stop
 # =============================================================================
@@ -153,6 +162,8 @@ def calc_stop_price(price: float, risk_stop_pct: float) -> float:
 def calc_shares(price: float, risk_stop_pct: float) -> Tuple[int, float, float, str]:
     if price <= 0:
         return 0, 0.0, 0.0, "invalid_price"
+
+    note = ""
 
     if USE_RISK_SIZING:
         stop_dist = price * (risk_stop_pct / 100.0)
@@ -185,8 +196,9 @@ def calc_shares(price: float, risk_stop_pct: float) -> Tuple[int, float, float, 
 
     return int(shares), round(position_value, 2), round(risk_usd, 2), note
 
+
 # =============================================================================
-# Cooldowns
+# Cooldowns (in-memory)
 # =============================================================================
 
 _last_global_ts = 0.0
@@ -196,13 +208,14 @@ def cooldown_block(symbol: str) -> Optional[str]:
     global _last_global_ts
     now = time.time()
 
-    if GLOBAL_COOLDOWN_SEC > 0:
-        if now - _last_global_ts < GLOBAL_COOLDOWN_SEC:
-            return f"Global cooldown active ({GLOBAL_COOLDOWN_SEC}s)."
+    if GLOBAL_COOLDOWN_SEC > 0 and (now - _last_global_ts < GLOBAL_COOLDOWN_SEC):
+        return f"Global cooldown active ({GLOBAL_COOLDOWN_SEC}s)."
+
     if SYMBOL_COOLDOWN_SEC > 0:
         last = _last_symbol_ts.get(symbol, 0.0)
         if now - last < SYMBOL_COOLDOWN_SEC:
             return f"Symbol cooldown active for {symbol} ({SYMBOL_COOLDOWN_SEC}s)."
+
     return None
 
 def cooldown_mark(symbol: str):
@@ -210,6 +223,7 @@ def cooldown_mark(symbol: str):
     now = time.time()
     _last_global_ts = now
     _last_symbol_ts[symbol] = now
+
 
 # =============================================================================
 # Google Sheets helpers
@@ -236,7 +250,6 @@ def ensure_tabs_exist(tab_names: List[str]):
     if not SHEETS_ON:
         return
     svc = sheets_service()
-
     meta = svc.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
     existing = {s["properties"]["title"] for s in meta.get("sheets", [])}
 
@@ -264,7 +277,8 @@ def clear_tab(tab: str):
 def get_header(tab: str) -> List[str]:
     svc = sheets_service()
     res = svc.spreadsheets().values().get(
-        spreadsheetId=GOOGLE_SHEET_ID, range=f"{tab}!1:1"
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{tab}!1:1"
     ).execute()
     vals = res.get("values") or []
     return vals[0] if vals else []
@@ -295,10 +309,11 @@ def append_row(tab: str, row: List[Any]):
         body={"values": [row]}
     ).execute()
 
-def read_table(tab: str) -> Tuple[List[str], List[List[str]]]:
+def read_table(tab: str, rng: str = "A:Z") -> Tuple[List[str], List[List[str]]]:
     svc = sheets_service()
     res = svc.spreadsheets().values().get(
-        spreadsheetId=GOOGLE_SHEET_ID, range=f"{tab}!A:Z"
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{tab}!{rng}"
     ).execute()
     values = res.get("values") or []
     if not values:
@@ -314,6 +329,17 @@ def update_row(tab: str, row_index_1based: int, values: List[Any]):
         valueInputOption="RAW",
         body={"values": [values]}
     ).execute()
+
+def write_values_user_entered(tab: str, start_cell: str, rows: List[List[Any]]):
+    """Write formulas cleanly (USER_ENTERED so formulas evaluate)."""
+    svc = sheets_service()
+    svc.spreadsheets().values().update(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{tab}!{start_cell}",
+        valueInputOption="USER_ENTERED",
+        body={"values": rows}
+    ).execute()
+
 
 # =============================================================================
 # Sheet schemas
@@ -350,6 +376,72 @@ DAILY_HEADER = [
     "avg_pnl", "avg_win", "avg_loss"
 ]
 
+def write_daily_formulas():
+    """
+    Daily becomes formula-driven from PnL so deleting a PnL row updates Daily instantly.
+    No more recompute_daily_from_pnl().
+    """
+    if not SHEETS_ON:
+        return
+
+    # Put headers (A1:I1) already set; formulas start at A2.
+    rows = [
+        # A2: dates list
+        [f"=SORT(UNIQUE(FILTER({PNL_TAB}!B2:B, {PNL_TAB}!B2:B<>\"\")))"],
+        # B2: trades per date (ARRAYFORMULA)
+        [f"=ARRAYFORMULA(IF(A2:A=\"\",,COUNTIF({PNL_TAB}!B:B, A2:A)))"],
+        # C2: gross pnl per date
+        [f"=ARRAYFORMULA(IF(A2:A=\"\",,SUMIF({PNL_TAB}!B:B, A2:A, {PNL_TAB}!J:J)))"],
+        # D2: wins
+        [f"=ARRAYFORMULA(IF(A2:A=\"\",,COUNTIFS({PNL_TAB}!B:B, A2:A, {PNL_TAB}!J:J, \">0\")))"],
+        # E2: losses
+        [f"=ARRAYFORMULA(IF(A2:A=\"\",,COUNTIFS({PNL_TAB}!B:B, A2:A, {PNL_TAB}!J:J, \"<0\")))"],
+        # F2: win_rate
+        [f"=ARRAYFORMULA(IF(A2:A=\"\",,IF(B2:B=0,0,D2:D/B2:B)))"],
+        # G2: avg_pnl
+        [f"=ARRAYFORMULA(IF(A2:A=\"\",,IF(B2:B=0,0,C2:C/B2:B)))"],
+        # H2: avg_win
+        [f"=ARRAYFORMULA(IF(A2:A=\"\",,IF(D2:D=0,0,SUMIFS({PNL_TAB}!J:J, {PNL_TAB}!B:B, A2:A, {PNL_TAB}!J:J, \">0\")/D2:D)))"],
+        # I2: avg_loss
+        [f"=ARRAYFORMULA(IF(A2:A=\"\",,IF(E2:E=0,0,SUMIFS({PNL_TAB}!J:J, {PNL_TAB}!B:B, A2:A, {PNL_TAB}!J:J, \"<0\")/E2:E)))"],
+    ]
+
+    # Write them down columns A..I (one formula per column at row 2)
+    # We'll update A2, then B2, ... I2 by writing each to its correct cell.
+    write_values_user_entered(DAILY_TAB, "A2", [rows[0]])
+    write_values_user_entered(DAILY_TAB, "B2", [rows[1]])
+    write_values_user_entered(DAILY_TAB, "C2", [rows[2]])
+    write_values_user_entered(DAILY_TAB, "D2", [rows[3]])
+    write_values_user_entered(DAILY_TAB, "E2", [rows[4]])
+    write_values_user_entered(DAILY_TAB, "F2", [rows[5]])
+    write_values_user_entered(DAILY_TAB, "G2", [rows[6]])
+    write_values_user_entered(DAILY_TAB, "H2", [rows[7]])
+    write_values_user_entered(DAILY_TAB, "I2", [rows[8]])
+
+    log.info("Daily formulas installed (formula-driven from PnL).")
+
+def write_dashboard_formulas():
+    """
+    Simple dashboard that always updates from PnL + Daily.
+    """
+    if not SHEETS_ON:
+        return
+
+    rows = [
+        ["Performance Dashboard"],
+        [""],
+        ["Metric", "Value"],
+        ["All-time Net P&L", f"=IFERROR(SUM({PNL_TAB}!J:J),0)"],
+        ["All-time Trades", f"=IFERROR(COUNTA({PNL_TAB}!A:A)-1,0)"],
+        ["All-time Win Rate", f"=IFERROR(COUNTIF({PNL_TAB}!J:J,\">0\")/(COUNTA({PNL_TAB}!J:J)-1),0)"],
+        ["All-time Avg Trade", f"=IFERROR(AVERAGE({PNL_TAB}!J:J),0)"],
+        ["Today Net P&L", f"=IFERROR(SUMIF({PNL_TAB}!B:B, TEXT(TODAY(),\"yyyy-mm-dd\"), {PNL_TAB}!J:J),0)"],
+        ["Today Trades", f"=IFERROR(COUNTIF({PNL_TAB}!B:B, TEXT(TODAY(),\"yyyy-mm-dd\")),0)"],
+        ["Today Win Rate", f"=IFERROR(COUNTIFS({PNL_TAB}!B:B, TEXT(TODAY(),\"yyyy-mm-dd\"), {PNL_TAB}!J:J, \">0\")/MAX(1,COUNTIF({PNL_TAB}!B:B, TEXT(TODAY(),\"yyyy-mm-dd\"))),0)"],
+    ]
+    write_values_user_entered(DASHBOARD_TAB, "A1", rows)
+    log.info("Dashboard formulas installed.")
+
 def init_sheets():
     if not SHEETS_ON:
         return
@@ -364,92 +456,21 @@ def init_sheets():
         set_header_force(POSITIONS_TAB, POSITIONS_HEADER)
         set_header_force(PNL_TAB, PNL_HEADER)
         set_header_force(DAILY_TAB, DAILY_HEADER)
+        set_header_force(DASHBOARD_TAB, [""])  # will be overwritten by dashboard writer
     else:
         set_header_if_missing(GOOGLE_SHEET_TAB, RAW_HEADER)
         set_header_if_missing(POSITIONS_TAB, POSITIONS_HEADER)
         set_header_if_missing(PNL_TAB, PNL_HEADER)
         set_header_if_missing(DAILY_TAB, DAILY_HEADER)
+        # dashboard can be created if empty
+        if not get_header(DASHBOARD_TAB):
+            set_header_force(DASHBOARD_TAB, [""])
 
-def daily_write_formulas():
-    """
-    Writes array formulas into the Daily tab so it auto-calculates from PnL tab.
-    Assumes:
-      - PnL!B = date (yyyy-mm-dd)
-      - PnL!J = gross_pnl
-    """
-    if not SHEETS_ON:
-        return
+    # Install formulas once (or re-install if FORCE_RESET_SHEETS)
+    if SHEETS_FORMULAS_MODE:
+        write_daily_formulas()
+        write_dashboard_formulas()
 
-    svc = sheets_service()
-
-    rows = [
-        DAILY_HEADER,
-        [
-            '=IFERROR(SORT(UNIQUE(FILTER({pnl_date}, {pnl_date}<>"" ))), "")'.format(
-                pnl_date=f"{PNL_TAB}!B2:B"
-            ),
-            '=IFERROR(ARRAYFORMULA(IF(A2:A="",,COUNTIF({pnl_date}, A2:A))), "")'.format(
-                pnl_date=f"{PNL_TAB}!B2:B"
-            ),
-            '=IFERROR(ARRAYFORMULA(IF(A2:A="",,SUMIF({pnl_date}, A2:A, {pnl_pnl}))), "")'.format(
-                pnl_date=f"{PNL_TAB}!B2:B",
-                pnl_pnl=f"{PNL_TAB}!J2:J"
-            ),
-            '=IFERROR(ARRAYFORMULA(IF(A2:A="",,COUNTIFS({pnl_date}, A2:A, {pnl_pnl}, ">0"))), "")'.format(
-                pnl_date=f"{PNL_TAB}!B2:B",
-                pnl_pnl=f"{PNL_TAB}!J2:J"
-            ),
-            '=IFERROR(ARRAYFORMULA(IF(A2:A="",,COUNTIFS({pnl_date}, A2:A, {pnl_pnl}, "<0"))), "")'.format(
-                pnl_date=f"{PNL_TAB}!B2:B",
-                pnl_pnl=f"{PNL_TAB}!J2:J"
-            ),
-            '=IFERROR(ARRAYFORMULA(IF(A2:A="",,IF(B2:B=0,,D2:D/B2:B))), "")',
-            '=IFERROR(ARRAYFORMULA(IF(A2:A="",,IF(B2:B=0,,C2:C/B2:B))), "")',
-            '=IFERROR(ARRAYFORMULA(IF(A2:A="",,IF(D2:D=0,,SUMIFS({pnl_pnl},{pnl_date},A2:A,{pnl_pnl},">0")/D2:D))), "")'.format(
-                pnl_date=f"{PNL_TAB}!B2:B",
-                pnl_pnl=f"{PNL_TAB}!J2:J"
-            ),
-            '=IFERROR(ARRAYFORMULA(IF(A2:A="",,IF(E2:E=0,,SUMIFS({pnl_pnl},{pnl_date},A2:A,{pnl_pnl},"<0")/E2:E))), "")'.format(
-                pnl_date=f"{PNL_TAB}!B2:B",
-                pnl_pnl=f"{PNL_TAB}!J2:J"
-            ),
-        ]
-    ]
-
-    svc.spreadsheets().values().update(
-        spreadsheetId=GOOGLE_SHEET_ID,
-        range=f"{DAILY_TAB}!A1",
-        valueInputOption="USER_ENTERED",
-        body={"values": rows}
-    ).execute()
-
-    log.info("Daily formulas written to tab=%s", DAILY_TAB)
-
-def dash_write_layout():
-    if not SHEETS_ON:
-        return
-    svc = sheets_service()
-
-    rows = [
-        ["Performance Dashboard"],
-        [""],
-        ["Metric", "Value"],
-        ["All-time Net P&L", f"=IFERROR(SUM({PNL_TAB}!J:J),0)"],
-        ["All-time Trades", f"=IFERROR(COUNTA({PNL_TAB}!A:A)-1,0)"],
-        ["All-time Win Rate", f"=IFERROR(COUNTIF({PNL_TAB}!J:J,\">0\")/(COUNTA({PNL_TAB}!J:J)-1),0)"],
-        ["All-time Avg Trade", f"=IFERROR(AVERAGE({PNL_TAB}!J:J),0)"],
-        ["Today Net P&L", f"=IFERROR(SUMIF({PNL_TAB}!B:B, TEXT(TODAY(),\"yyyy-mm-dd\"), {PNL_TAB}!J:J),0)"],
-        ["Today Trades", f"=IFERROR(COUNTIF({PNL_TAB}!B:B, TEXT(TODAY(),\"yyyy-mm-dd\")),0)"],
-    ]
-
-    svc.spreadsheets().values().update(
-        spreadsheetId=GOOGLE_SHEET_ID,
-        range=f"{DASHBOARD_TAB}!A1",
-        valueInputOption="USER_ENTERED",
-        body={"values": rows}
-    ).execute()
-
-    log.info("Dashboard formulas written to tab=%s", DASHBOARD_TAB)
 
 # =============================================================================
 # Positions tab helpers
@@ -459,7 +480,7 @@ def pos_get(symbol: str) -> Optional[Dict[str, Any]]:
     if not SHEETS_ON:
         return None
 
-    header, rows = read_table(POSITIONS_TAB)
+    header, rows = read_table(POSITIONS_TAB, rng="A:Z")
     if not header:
         return None
 
@@ -467,11 +488,12 @@ def pos_get(symbol: str) -> Optional[Dict[str, Any]]:
     for i, r in enumerate(rows):
         sym = (r[idx.get("symbol", 0)] if idx.get("symbol", 0) < len(r) else "").strip().upper()
         if sym == symbol.upper():
-            out = {}
+            out: Dict[str, Any] = {}
             for k, j in idx.items():
                 out[k] = r[j] if j < len(r) else ""
-            out["_row_index_1based"] = i + 2
+            out["_row_index_1based"] = i + 2  # header row is 1
             return out
+
     return None
 
 def pos_set(symbol: str, state: str, entry_time: str, entry_price: float, shares: int,
@@ -520,8 +542,9 @@ def pos_flat(symbol: str, last_event: str, notes: str):
     else:
         append_row(POSITIONS_TAB, row)
 
+
 # =============================================================================
-# PnL append
+# PnL write helper (PnL is the source of truth for stats)
 # =============================================================================
 
 def append_pnl_row(trade_id: str, symbol: str, entry_time: str, exit_time: str,
@@ -541,30 +564,13 @@ def append_pnl_row(trade_id: str, symbol: str, entry_time: str, exit_time: str,
         ret_pct, notes
     ])
 
+
 # =============================================================================
-# Boot Sheets
+# Boot Sheets (once per worker start)
 # =============================================================================
 if SHEETS_ON:
     init_sheets()
 
-# =============================================================================
-# Setup auth helper
-# =============================================================================
-
-def setup_auth_ok() -> bool:
-    """
-    Require SETUP_TOKEN to be set.
-    Client provides token via:
-      - header: X-Setup-Token: <token>
-      - OR query param: ?token=<token>
-    """
-    if not SETUP_TOKEN:
-        return False
-
-    header_token = (request.headers.get("X-Setup-Token") or "").strip()
-    query_token = (request.args.get("token") or "").strip()
-    provided = header_token or query_token
-    return provided == SETUP_TOKEN
 
 # =============================================================================
 # Routes
@@ -577,41 +583,6 @@ def root():
 @app.route("/health", methods=["GET"])
 def health():
     return "OK", 200
-
-@app.route("/setup_sheets", methods=["POST"])
-def setup_sheets():
-    """
-    Rebuilds:
-      - Daily formulas (auto-calc from PnL)
-      - Dashboard formulas
-
-    Optional:
-      - ?reset=1  -> runs init_sheets() first (and will clear tabs if FORCE_RESET_SHEETS=1)
-    """
-    if not SHEETS_ON:
-        return jsonify({"ok": False, "error": "SHEETS_ON is not enabled"}), 400
-
-    if not setup_auth_ok():
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-
-    reset = (request.args.get("reset") or "").strip() == "1"
-
-    try:
-        if reset:
-            init_sheets()
-
-        daily_write_formulas()
-        dash_write_layout()
-
-        return jsonify({
-            "ok": True,
-            "reset": reset,
-            "daily_tab": DAILY_TAB,
-            "dashboard_tab": DASHBOARD_TAB
-        }), 200
-    except Exception as e:
-        log.exception("setup_sheets failed")
-        return jsonify({"ok": False, "error": "setup_failed", "detail": str(e)}), 500
 
 @app.route("/tv", methods=["POST", "GET"])
 def tv():
@@ -646,6 +617,7 @@ def tv():
     if side != "long":
         return jsonify({"ok": False, "error": "Only long side supported"}), 400
 
+    # Map events
     if event in ("BUY", "ENTRY"):
         mapped = "ENTRY"
     elif event in ("SELL", "EXIT"):
@@ -653,53 +625,75 @@ def tv():
     else:
         return jsonify({"ok": False, "error": "Unsupported event", "event": event}), 400
 
+    # Cooldown check
     cd = cooldown_block(symbol)
     if cd:
         log.info("[%s] cooldown blocked: %s", req_id, cd)
         if SHEETS_ON:
-            append_row(
-                GOOGLE_SHEET_TAB,
-                [now_iso(), symbol, event, mapped, side,
-                 price if price is not None else "",
-                 "", "", "", "", "cooldown", cd, req_id]
-            )
+            append_row(GOOGLE_SHEET_TAB, [
+                now_iso(), symbol, event, mapped, side,
+                price if price is not None else "",
+                "", "", "", "",
+                "cooldown", cd, req_id
+            ])
         return jsonify({"ok": True, "status": "cooldown", "reason": cd}), 200
 
-    # ---- HARD STATE BLOCK (no multiple entry / exit) ----
+    # Positions state gate
     current = pos_get(symbol) if SHEETS_ON else None
     state = (current.get("state") if current else "FLAT") or "FLAT"
 
     if mapped == "ENTRY" and state == "LONG":
         log.info("[%s] ENTRY ignored: already LONG for %s", req_id, symbol)
         if SHEETS_ON:
-            append_row(
-                GOOGLE_SHEET_TAB,
-                [now_iso(), symbol, event, mapped, side,
-                 price if price is not None else "",
-                 "", "", "", "", "ignored", "Already in position (LONG)", req_id]
-            )
+            append_row(GOOGLE_SHEET_TAB, [
+                now_iso(), symbol, event, mapped, side,
+                price if price is not None else "",
+                "", "", "", "",
+                "ignored", "Already in position (LONG)", req_id
+            ])
         return jsonify({"ok": True, "ignored": True, "reason": "Already in position (LONG)"}), 200
 
     if mapped == "EXIT" and state != "LONG":
         log.info("[%s] EXIT ignored: no open position for %s (state=%s)", req_id, symbol, state)
         if SHEETS_ON:
-            append_row(
-                GOOGLE_SHEET_TAB,
-                [now_iso(), symbol, event, mapped, side,
-                 price if price is not None else "",
-                 "", "", "", "", "ignored", "No open position to exit", req_id]
-            )
+            append_row(GOOGLE_SHEET_TAB, [
+                now_iso(), symbol, event, mapped, side,
+                price if price is not None else "",
+                "", "", "", "",
+                "ignored", "No open position to exit", req_id
+            ])
         return jsonify({"ok": True, "ignored": True, "reason": "No open position to exit"}), 200
 
+    # Optional: prevent symbol-switch accidents (helps stop “messed up trade” rows)
+    if mapped == "EXIT" and BLOCK_SYMBOL_MISMATCH and current:
+        cur_sym = (current.get("symbol") or "").strip().upper()
+        if cur_sym and cur_sym != symbol.upper():
+            msg = f"Symbol mismatch: EXIT {symbol} but open position is {cur_sym}"
+            log.warning("[%s] %s", req_id, msg)
+            if SHEETS_ON:
+                append_row(GOOGLE_SHEET_TAB, [
+                    now_iso(), symbol, event, mapped, side,
+                    price if price is not None else "",
+                    "", "", "", "",
+                    "blocked", msg, req_id
+                ])
+            return jsonify({"ok": False, "error": "symbol_mismatch", "detail": msg}), 400
+
+    # Need price
     if price is None:
         note = "Missing price. Include price in TradingView webhook JSON (e.g. using {{close}})."
         if SHEETS_ON:
-            append_row(GOOGLE_SHEET_TAB, [now_iso(), symbol, event, mapped, side, "", "", "", "", "", "error", note, req_id])
+            append_row(GOOGLE_SHEET_TAB, [
+                now_iso(), symbol, event, mapped, side,
+                "", "", "", "", "",
+                "error", note, req_id
+            ])
         return jsonify({"ok": False, "error": "missing_price", "detail": note}), 400
 
     shares, position_value, risk_usd, sizing_note = calc_shares(price, risk_stop_pct)
     stop_price = calc_stop_price(price, risk_stop_pct)
 
+    # mark cooldown only once the signal is accepted
     cooldown_mark(symbol)
 
     # DRY_RUN
@@ -709,18 +703,22 @@ def tv():
 
             if SHEETS_ON:
                 pos_set(symbol, "LONG", now_iso(), price, shares, position_value, stop_price, risk_usd, "ENTRY", trade_id, sizing_note)
-                append_row(
-                    GOOGLE_SHEET_TAB,
-                    [now_iso(), symbol, event, mapped, side, price, shares, position_value,
-                     stop_price, risk_usd, "dry_run", sizing_note, req_id]
-                )
+                append_row(GOOGLE_SHEET_TAB, [
+                    now_iso(), symbol, event, mapped, side,
+                    price, shares, position_value,
+                    stop_price, risk_usd,
+                    "dry_run", sizing_note, req_id
+                ])
 
             return jsonify({
-                "ok": True, "dry_run": True, "mapped": "ENTRY", "symbol": symbol, "price": price,
-                "shares": shares, "position_value": position_value, "stop_price": stop_price,
-                "risk_usd": risk_usd, "note": sizing_note, "request_id": req_id
+                "ok": True, "dry_run": True, "mapped": "ENTRY",
+                "symbol": symbol, "price": price,
+                "shares": shares, "position_value": position_value,
+                "stop_price": stop_price, "risk_usd": risk_usd,
+                "note": sizing_note, "request_id": req_id
             }), 200
 
+        # EXIT in DRY_RUN => log PnL + set FLAT
         if mapped == "EXIT":
             if not current:
                 return jsonify({"ok": True, "ignored": True, "reason": "No position record"}), 200
@@ -731,27 +729,29 @@ def tv():
             trade_id = current.get("trade_id") or f"{symbol}-{int(time.time())}"
 
             gross_pnl = round((price - entry_price) * entry_shares, 2) if entry_shares else 0.0
-            notes = f"dry_run_exit_pnl={gross_pnl}"
+            notes = f"dry_run"
 
             if SHEETS_ON:
-                append_row(
-                    GOOGLE_SHEET_TAB,
-                    [now_iso(), symbol, event, mapped, side, price, entry_shares,
-                     round(entry_shares * price, 2), "", "", "dry_run_exit", notes, req_id]
-                )
+                append_row(GOOGLE_SHEET_TAB, [
+                    now_iso(), symbol, event, mapped, side,
+                    price, entry_shares, round(entry_shares * price, 2),
+                    "", "",  # stop/risk not needed on exit log row
+                    "dry_run_exit", f"gross_pnl={gross_pnl}", req_id
+                ])
 
-                append_pnl_row(
-                    trade_id, symbol, entry_time, now_iso(),
-                    entry_price, price, entry_shares,
-                    entry_shares * entry_price, "dry_run"
-                )
+                append_pnl_row(trade_id, symbol, entry_time, now_iso(), entry_price, price, entry_shares,
+                               entry_shares * entry_price, notes)
 
                 pos_flat(symbol, "EXIT", "closed in dry_run")
 
+                # NOTE: Daily + Dashboard are formula-driven now; no recompute calls needed.
+
             return jsonify({
-                "ok": True, "dry_run": True, "mapped": "EXIT", "symbol": symbol,
-                "entry_price": entry_price, "exit_price": price, "shares": entry_shares,
-                "gross_pnl": gross_pnl, "request_id": req_id
+                "ok": True, "dry_run": True, "mapped": "EXIT",
+                "symbol": symbol,
+                "entry_price": entry_price, "exit_price": price,
+                "shares": entry_shares, "gross_pnl": gross_pnl,
+                "request_id": req_id
             }), 200
 
     # LIVE mode
@@ -762,14 +762,16 @@ def tv():
             if SHEETS_ON:
                 trade_id = f"{symbol}-{int(time.time())}"
                 pos_set(symbol, "LONG", now_iso(), price, shares, position_value, stop_price, risk_usd, "ENTRY", trade_id, "LIVE: " + sizing_note)
-                append_row(
-                    GOOGLE_SHEET_TAB,
-                    [now_iso(), symbol, event, mapped, side, price, shares, position_value,
-                     stop_price, risk_usd, "live_entry", "Order sent", req_id]
-                )
+                append_row(GOOGLE_SHEET_TAB, [
+                    now_iso(), symbol, event, mapped, side,
+                    price, shares, position_value,
+                    stop_price, risk_usd,
+                    "live_entry", "Order sent", req_id
+                ])
 
             return jsonify({"ok": True, "live": True, "mapped": "ENTRY", "broker": broker}), 200
 
+        # EXIT: SELL all shares recorded in Positions
         current = pos_get(symbol) if SHEETS_ON else None
         entry_shares = shares
         entry_price = None
@@ -785,34 +787,38 @@ def tv():
         broker = qt_place_market_order(symbol, "SELL", entry_shares)
 
         if SHEETS_ON:
-            append_row(
-                GOOGLE_SHEET_TAB,
-                [now_iso(), symbol, event, mapped, side, price, entry_shares,
-                 round(entry_shares * price, 2), "", "", "live_exit", "Order sent", req_id]
-            )
+            append_row(GOOGLE_SHEET_TAB, [
+                now_iso(), symbol, event, mapped, side,
+                price, entry_shares, round(entry_shares * price, 2),
+                "", "",
+                "live_exit", "Order sent", req_id
+            ])
 
             if entry_price is not None and entry_shares:
-                append_pnl_row(
-                    trade_id, symbol, entry_time, now_iso(),
-                    float(entry_price), float(price),
-                    int(entry_shares), float(entry_price) * int(entry_shares),
-                    "live"
-                )
+                append_pnl_row(trade_id, symbol, entry_time, now_iso(), float(entry_price), float(price),
+                               int(entry_shares), float(entry_price) * int(entry_shares), "live")
 
             pos_flat(symbol, "EXIT", "closed live")
+
+            # NOTE: Daily + Dashboard are formula-driven now; no recompute calls needed.
 
         return jsonify({"ok": True, "live": True, "mapped": "EXIT", "broker": broker}), 200
 
     except Exception as e:
         log.exception("[%s] live order failed", req_id)
         if SHEETS_ON:
-            append_row(
-                GOOGLE_SHEET_TAB,
-                [now_iso(), symbol, event, mapped, side, price, shares, position_value,
-                 stop_price, risk_usd, "error", str(e)[:200], req_id]
-            )
+            append_row(GOOGLE_SHEET_TAB, [
+                now_iso(), symbol, event, mapped, side,
+                price, shares, position_value,
+                stop_price, risk_usd,
+                "error", str(e)[:200], req_id
+            ])
         return jsonify({"ok": False, "error": "order_failed", "detail": str(e)}), 500
 
+
+# =============================================================================
+# Local dev entry point (Render uses gunicorn)
+# =============================================================================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
